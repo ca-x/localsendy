@@ -6,6 +6,8 @@ import type {
   PendingTransfer,
   ReceivedFile,
   StatusResponse,
+  StorageSettings,
+  DirectoryListing,
 } from './types';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -39,6 +41,23 @@ export const decidePending = (decision: 'accept' | 'reject') =>
   request<void>(`/pending/${decision}`, { method: 'POST' });
 export const getHistory = () => request<ReceivedFile[]>('/history');
 export const getTransfers = () => request<OutgoingTransfer[]>('/transfers');
+export const getStorageSettings = () => request<StorageSettings>('/storage');
+export const updateStorageSettings = (subdirectory: string) =>
+  request<StorageSettings>('/storage', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ subdirectory }),
+  });
+export const listStorageDirectories = (path = '') => {
+  const query = new URLSearchParams({ path });
+  return request<DirectoryListing>(`/storage/directories?${query}`);
+};
+export const createStorageDirectory = (parent: string, name: string) =>
+  request<DirectoryListing>('/storage/directories', {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ parent, name }),
+  });
 
 export async function sendFiles(target: DeviceInfo, files: File[], pin?: string) {
   const form = new FormData();

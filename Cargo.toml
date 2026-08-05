@@ -7,12 +7,21 @@ license = "MIT"
 description = "A Docker-first LocalSend web client powered by Rust"
 repository = "https://github.com/ca-x/localsendy"
 
+[workspace]
+members = ["crates/localsendy-core", "crates/localsendy-storage"]
+exclude = ["third_party/localsend-core"]
+resolver = "2"
+
 [dependencies]
 anyhow = "1.0.100"
 axum = { version = "0.8.8", features = ["json", "macros", "multipart"] }
+bytes = "1.11.1"
 chrono = { version = "0.4.43", features = ["serde"] }
+futures-util = "0.3.31"
 if-addrs = "0.15.0"
-localsend-rs = { version = "0.1.2", default-features = false, features = ["https"] }
+localsend = { path = "third_party/localsend-core", features = ["crypto", "discovery", "http", "multicast"] }
+localsendy-core = { path = "crates/localsendy-core" }
+localsendy-storage = { path = "crates/localsendy-storage" }
 mime_guess = "2.0.5"
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "rustls"] }
 rust-embed = "8.8.0"
@@ -21,6 +30,8 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 socket2 = { version = "0.6.2", features = ["all"] }
 tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-stream = "0.1.18"
+tokio-util = { version = "0.7.18", features = ["rt"] }
 tower-http = { version = "0.6.8", features = ["catch-panic", "compression-gzip", "set-header", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
@@ -28,6 +39,7 @@ uuid = { version = "1.19.0", features = ["serde", "v4"] }
 
 [dev-dependencies]
 http-body-util = "0.1.3"
+tempfile = "3.23.0"
 tower = { version = "0.5.2", features = ["util"] }
 
 [profile.release]

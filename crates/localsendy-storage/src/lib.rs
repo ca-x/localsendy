@@ -1,0 +1,471 @@
+use anyhow::{Context, Result, bail};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use serde::{Serialize, de::DeserializeOwned};
+use std::{
+    path::Path,
+    sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
+};
+
+const SCHEMA_VERSION: i64 = 1;
+pub const SINGLE_USER_SUBJECT: &str = "single";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstanceKey {
+    pub subject: String,
+}
+
+impl InstanceKey {
+    pub fn single() -> Self {
+        Self {
+            subject: SINGLE_USER_SUBJECT.to_owned(),
+        }
+    }
+
+    pub fn instance_id(&self) -> String {
+        format!("single:{}", self.subject)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SettingScope<'a> {
+    Global,
+    Instance(&'a InstanceKey),
+}
+
+impl SettingScope<'_> {
+    fn key(&self) -> String {
+        match self {
+            Self::Global => "global".to_owned(),
+            Self::Instance(instance) => instance.instance_id(),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct Database {
+    connection: Arc<Mutex<Connection>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstanceDefaults<'a> {
+    pub key: &'a InstanceKey,
+    pub alias: &'a str,
+    pub device_type: &'a str,
+    pub device_model: Option<&'a str>,
+    pub preferred_port: u16,
+    pub identity_path: &'a str,
+    pub download_path: &'a str,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct InstanceRecord {
+    pub instance_id: String,
+    pub key: InstanceKey,
+    pub alias: String,
+    pub device_type: String,
+    pub device_model: Option<String>,
+    pub port: u16,
+    pub identity_path: String,
+    pub download_path: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TransferRecord {
+    pub id: String,
+    pub instance_id: String,
+    pub direction: String,
+    pub peer_alias: String,
+    pub file_name: String,
+    pub size: u64,
+    pub status: String,
+    pub created_at_ms: i64,
+    pub error: Option<String>,
+}
+
+impl Database {
+    pub fn open(path: &Path) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        let mut connection = Connection::open(path)
+            .with_context(|| format!("failed to open SQLite database {}", path.display()))?;
+        connection.busy_timeout(Duration::from_secs(5))?;
+        connection.execute_batch(
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
+        )?;
+        migrate(&mut connection)?;
+        Ok(Self {
+            connection: Arc::new(Mutex::new(connection)),
+        })
+    }
+
+    pub fn ensure_instance(&self, defaults: InstanceDefaults<'_>) -> Result<InstanceRecord> {
+        validate_subject(&defaults.key.subject)?;
+        let instance_id = defaults.key.instance_id();
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(existing) = query_instance(&transaction, &instance_id)? {
+            transaction.commit()?;
+            return Ok(existing);
+        }
+
+        let port = allocate_port(&transaction, defaults.preferred_port)?;
+        transaction.execute(
+            r#"
+            INSERT INTO instances (
+                instance_id, auth_mode, subject, alias, device_type, device_model,
+                port, identity_path, download_path
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "#,
+            params![
+                instance_id,
+                "single",
+                defaults.key.subject,
+                defaults.alias,
+                defaults.device_type,
+                defaults.device_model,
+                port,
+                defaults.identity_path,
+                defaults.download_path,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(InstanceRecord {
+            instance_id,
+            key: defaults.key.clone(),
+            alias: defaults.alias.to_owned(),
+            device_type: defaults.device_type.to_owned(),
+            device_model: defaults.device_model.map(ToOwned::to_owned),
+            port,
+            identity_path: defaults.identity_path.to_owned(),
+            download_path: defaults.download_path.to_owned(),
+        })
+    }
+
+    pub fn update_instance_alias(&self, key: &InstanceKey, alias: &str) -> Result<()> {
+        let changed = self.lock()?.execute(
+            "UPDATE instances SET alias = ?2, updated_at_ms = unixepoch('subsec') * 1000 WHERE instance_id = ?1",
+            params![key.instance_id(), alias],
+        )?;
+        if changed == 0 {
+            bail!("unknown Localsendy instance")
+        }
+        Ok(())
+    }
+
+    pub fn load_setting<T: DeserializeOwned>(
+        &self,
+        scope: SettingScope<'_>,
+        key: &str,
+    ) -> Result<Option<T>> {
+        validate_setting_key(key)?;
+        let value = self
+            .lock()?
+            .query_row(
+                "SELECT value_json FROM settings WHERE scope = ?1 AND key = ?2",
+                params![scope.key(), key],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        value
+            .map(|value| serde_json::from_str(&value).context("failed to decode stored setting"))
+            .transpose()
+    }
+
+    pub fn store_setting<T: Serialize>(
+        &self,
+        scope: SettingScope<'_>,
+        key: &str,
+        value: &T,
+    ) -> Result<()> {
+        validate_setting_key(key)?;
+        let value = serde_json::to_string(value)?;
+        self.lock()?.execute(
+            r#"
+            INSERT INTO settings (scope, key, value_json, updated_at_ms)
+            VALUES (?1, ?2, ?3, unixepoch('subsec') * 1000)
+            ON CONFLICT(scope, key) DO UPDATE SET
+                value_json = excluded.value_json,
+                updated_at_ms = excluded.updated_at_ms
+            "#,
+            params![scope.key(), key, value],
+        )?;
+        Ok(())
+    }
+
+    pub fn record_transfer(&self, transfer: &TransferRecord) -> Result<()> {
+        let size = i64::try_from(transfer.size).context("transfer size exceeds SQLite range")?;
+        self.lock()?.execute(
+            r#"
+            INSERT INTO transfers (
+                id, instance_id, direction, peer_alias, file_name, size,
+                status, created_at_ms, error
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            ON CONFLICT(id) DO UPDATE SET
+                status = excluded.status,
+                error = excluded.error
+            "#,
+            params![
+                transfer.id,
+                transfer.instance_id,
+                transfer.direction,
+                transfer.peer_alias,
+                transfer.file_name,
+                size,
+                transfer.status,
+                transfer.created_at_ms,
+                transfer.error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_transfers(&self, key: &InstanceKey, limit: usize) -> Result<Vec<TransferRecord>> {
+        let limit = i64::try_from(limit.min(1000)).expect("transfer history limit is bounded");
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            r#"
+            SELECT id, instance_id, direction, peer_alias, file_name, size,
+                   status, created_at_ms, error
+            FROM transfers
+            WHERE instance_id = ?1
+            ORDER BY created_at_ms DESC, id DESC
+            LIMIT ?2
+            "#,
+        )?;
+        let rows = statement.query_map(params![key.instance_id(), limit], |row| {
+            let size = row.get::<_, i64>(5)?;
+            let size = u64::try_from(size).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })?;
+            Ok(TransferRecord {
+                id: row.get(0)?,
+                instance_id: row.get(1)?,
+                direction: row.get(2)?,
+                peer_alias: row.get(3)?,
+                file_name: row.get(4)?,
+                size,
+                status: row.get(6)?,
+                created_at_ms: row.get(7)?,
+                error: row.get(8)?,
+            })
+        })?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    fn lock(&self) -> Result<MutexGuard<'_, Connection>> {
+        self.connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("SQLite connection lock is poisoned"))
+    }
+}
+
+fn migrate(connection: &mut Connection) -> Result<()> {
+    let current: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+    if current > SCHEMA_VERSION {
+        bail!("database schema version {current} is newer than supported version {SCHEMA_VERSION}");
+    }
+    if current == SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if current == 0 {
+        transaction.execute_batch(
+            r#"
+            CREATE TABLE instances (
+                instance_id TEXT PRIMARY KEY,
+                auth_mode TEXT NOT NULL CHECK (auth_mode = 'single'),
+                subject TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                device_type TEXT NOT NULL,
+                device_model TEXT,
+                port INTEGER NOT NULL UNIQUE CHECK (port BETWEEN 1 AND 65535),
+                identity_path TEXT NOT NULL,
+                download_path TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL DEFAULT (unixepoch('subsec') * 1000),
+                updated_at_ms INTEGER NOT NULL DEFAULT (unixepoch('subsec') * 1000),
+                UNIQUE (auth_mode, subject)
+            );
+
+            CREATE TABLE settings (
+                scope TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value_json TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL DEFAULT (unixepoch('subsec') * 1000),
+                PRIMARY KEY (scope, key)
+            );
+
+            CREATE TABLE transfers (
+                id TEXT PRIMARY KEY,
+                instance_id TEXT NOT NULL REFERENCES instances(instance_id) ON DELETE CASCADE,
+                direction TEXT NOT NULL CHECK (direction IN ('incoming', 'outgoing')),
+                peer_alias TEXT NOT NULL,
+                file_name TEXT NOT NULL,
+                size INTEGER NOT NULL CHECK (size >= 0),
+                status TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                error TEXT
+            );
+
+            CREATE INDEX idx_transfers_instance_created
+                ON transfers(instance_id, created_at_ms DESC);
+
+            PRAGMA user_version = 1;
+            "#,
+        )?;
+    }
+    transaction.commit()?;
+    Ok(())
+}
+
+fn query_instance(connection: &Connection, instance_id: &str) -> Result<Option<InstanceRecord>> {
+    connection
+        .query_row(
+            r#"
+            SELECT instance_id, auth_mode, subject, alias, device_type, device_model,
+                   port, identity_path, download_path
+            FROM instances WHERE instance_id = ?1
+            "#,
+            params![instance_id],
+            |row| {
+                match row.get::<_, String>(1)?.as_str() {
+                    "single" => {}
+                    value => {
+                        return Err(rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            format!("unknown auth mode {value}").into(),
+                        ));
+                    }
+                }
+                Ok(InstanceRecord {
+                    instance_id: row.get(0)?,
+                    key: InstanceKey {
+                        subject: row.get(2)?,
+                    },
+                    alias: row.get(3)?,
+                    device_type: row.get(4)?,
+                    device_model: row.get(5)?,
+                    port: row.get(6)?,
+                    identity_path: row.get(7)?,
+                    download_path: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn allocate_port(connection: &Connection, preferred: u16) -> Result<u16> {
+    for port in preferred..=u16::MAX {
+        let used = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM instances WHERE port = ?1)",
+            [port],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if !used {
+            return Ok(port);
+        }
+    }
+    bail!("no LocalSend TCP port is available")
+}
+
+fn validate_subject(subject: &str) -> Result<()> {
+    if subject != SINGLE_USER_SUBJECT {
+        bail!("single mode must use the fixed single-user subject")
+    }
+    if subject.is_empty()
+        || subject.len() > 128
+        || subject.chars().any(char::is_control)
+        || subject.contains(['/', '\\'])
+    {
+        bail!("invalid Localsendy identity subject")
+    }
+    Ok(())
+}
+
+fn validate_setting_key(key: &str) -> Result<()> {
+    if key.is_empty()
+        || key.len() > 128
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        bail!("invalid Localsendy setting key")
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn defaults<'a>(key: &'a InstanceKey, alias: &'a str, port: u16) -> InstanceDefaults<'a> {
+        InstanceDefaults {
+            key,
+            alias,
+            device_type: "server",
+            device_model: Some("Linux"),
+            preferred_port: port,
+            identity_path: "/data/identity.pem",
+            download_path: "/data/downloads",
+        }
+    }
+
+    #[test]
+    fn instances_keep_stable_ports() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("localsendy.sqlite3")).unwrap();
+        let key = InstanceKey::single();
+        let first = database
+            .ensure_instance(defaults(&key, "One", 53317))
+            .unwrap();
+        let again = database
+            .ensure_instance(defaults(&key, "Changed", 54000))
+            .unwrap();
+        assert_eq!(again, first);
+    }
+
+    #[test]
+    fn global_and_instance_settings_do_not_collide() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("localsendy.sqlite3")).unwrap();
+        let key = InstanceKey::single();
+        database
+            .store_setting(SettingScope::Global, "interfaces", &vec!["enp2s0"])
+            .unwrap();
+        database
+            .store_setting(SettingScope::Instance(&key), "interfaces", &vec!["lo"])
+            .unwrap();
+        let global: Vec<String> = database
+            .load_setting(SettingScope::Global, "interfaces")
+            .unwrap()
+            .unwrap();
+        let instance: Vec<String> = database
+            .load_setting(SettingScope::Instance(&key), "interfaces")
+            .unwrap()
+            .unwrap();
+        assert_eq!(global, vec!["enp2s0"]);
+        assert_eq!(instance, vec!["lo"]);
+    }
+
+    #[test]
+    fn rejects_future_database_versions() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("localsendy.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .pragma_update(None, "user_version", SCHEMA_VERSION + 1)
+            .unwrap();
+        drop(connection);
+        assert!(Database::open(&path).is_err());
+    }
+}

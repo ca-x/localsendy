@@ -7,20 +7,31 @@ use std::{
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Multipart, Path as AxumPath, State},
+    extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use bytes::Bytes;
 use chrono::Utc;
-use localsend_rs::{DeviceInfo, FileId, FileMetadata, LocalSendClient, Protocol};
+use futures_util::StreamExt;
+use localsend::{
+    http::{client::v2::LsHttpClientV2, dto_v2::PrepareUploadRequestDtoV2},
+    model::transfer::{FileContent, FileDto},
+};
+use localsendy_core::{DeviceInfo, DeviceType, FileId, Protocol, ReceivedFile};
+use localsendy_storage::SettingScope;
+use localsendy_storage::TransferRecord;
 use serde::{Deserialize, Serialize};
 use tokio::{fs::File, io::AsyncWriteExt};
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::network::{
-    DiscoveryCommand, NetworkMode, NetworkPreferences, NetworkSelection, NetworkSettings,
-    network_settings, route_interface_for_ip, save_preferences,
+    DEFAULT_MULTICAST_ADDRESS, DEFAULT_MULTICAST_GROUP_V6, DiscoveryCommand, NetworkMode,
+    NetworkPreferences, NetworkSelection, NetworkSettings, network_settings,
+    route_interface_for_ip, save_preferences,
 };
 use crate::state::{AppState, DiscoveredDevice, OutgoingTransfer, SeenDevice, TransferStatus};
 
@@ -32,6 +43,11 @@ pub fn router(state: AppState) -> Router {
         .route("/devices/scan", post(scan))
         .route("/devices/probe", post(probe_device))
         .route("/networks", get(networks).put(update_networks))
+        .route("/storage", get(storage).put(update_storage))
+        .route(
+            "/storage/directories",
+            get(storage_directories).post(create_storage_directory),
+        )
         .route("/pending", get(pending))
         .route("/pending/{decision}", post(decide_pending))
         .route("/history", get(history))
@@ -48,28 +64,156 @@ async fn health() -> StatusCode {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StatusResponse {
+    version: &'static str,
     alias: String,
+    device_type: Option<DeviceType>,
+    device_model: Option<String>,
     web_address: String,
     localsend_port: u16,
     protocol: String,
+    multicast_ipv4: String,
+    multicast_ipv6: String,
     data_directory: String,
     auto_accept: bool,
+    discovery_interval_seconds: u64,
+    max_upload_bytes: u64,
     uptime_seconds: u64,
     nearby_devices: usize,
 }
 
 async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
     let devices = state.active_devices();
+    let data_directory = state
+        .receiver_destination
+        .read()
+        .await
+        .display()
+        .to_string();
     Json(StatusResponse {
+        version: env!("CARGO_PKG_VERSION"),
         alias: state.config.alias.clone(),
+        device_type: state.local_device.device_type,
+        device_model: state.local_device.device_model.clone(),
         web_address: state.config.web_bind.to_string(),
         localsend_port: state.config.localsend_port,
         protocol: state.local_device.protocol.to_string(),
-        data_directory: state.config.downloads_dir().display().to_string(),
+        multicast_ipv4: DEFAULT_MULTICAST_ADDRESS.to_owned(),
+        multicast_ipv6: DEFAULT_MULTICAST_GROUP_V6.to_string(),
+        data_directory,
         auto_accept: state.config.auto_accept,
+        discovery_interval_seconds: state.config.discovery_interval_seconds,
+        max_upload_bytes: state.config.max_upload_bytes,
         uptime_seconds: state.started_at.elapsed().as_secs(),
         nearby_devices: devices.len(),
     })
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StorageResponse {
+    root: String,
+    subdirectory: String,
+    resolved_path: String,
+}
+
+async fn storage(State(state): State<AppState>) -> Json<StorageResponse> {
+    storage_response(&state).await
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateStorageRequest {
+    subdirectory: String,
+}
+
+async fn update_storage(
+    State(state): State<AppState>,
+    Json(request): Json<UpdateStorageRequest>,
+) -> Result<Json<StorageResponse>, ApiError> {
+    let (subdirectory, destination) =
+        crate::storage_path::resolve_subdirectory(&state.download_root, &request.subdirectory)
+            .await
+            .map_err(ApiError::bad_request)?;
+    state
+        .database
+        .store_setting(
+            SettingScope::Instance(&state.instance_key),
+            "save_subdirectory",
+            &subdirectory,
+        )
+        .map_err(ApiError::internal)?;
+    *state.download_subdirectory.write().await = subdirectory;
+    *state.receiver_destination.write().await = destination;
+    Ok(storage_response(&state).await)
+}
+
+async fn storage_response(state: &AppState) -> Json<StorageResponse> {
+    Json(StorageResponse {
+        root: state.download_root.display().to_string(),
+        subdirectory: state.download_subdirectory.read().await.clone(),
+        resolved_path: state
+            .receiver_destination
+            .read()
+            .await
+            .display()
+            .to_string(),
+    })
+}
+
+#[derive(Default, Deserialize)]
+struct DirectoryQuery {
+    path: Option<String>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DirectoryListingResponse {
+    path: String,
+    parent: Option<String>,
+    directories: Vec<String>,
+}
+
+async fn storage_directories(
+    State(state): State<AppState>,
+    Query(query): Query<DirectoryQuery>,
+) -> Result<Json<DirectoryListingResponse>, ApiError> {
+    let (path, directories) = crate::storage_path::list_subdirectories(
+        &state.download_root,
+        query.path.as_deref().unwrap_or_default(),
+    )
+    .await
+    .map_err(ApiError::bad_request)?;
+    let parent = path
+        .rsplit_once('/')
+        .map(|(parent, _)| parent.to_owned())
+        .or_else(|| (!path.is_empty()).then(String::new));
+    Ok(Json(DirectoryListingResponse {
+        path,
+        parent,
+        directories,
+    }))
+}
+
+#[derive(Deserialize)]
+struct CreateDirectoryRequest {
+    parent: String,
+    name: String,
+}
+
+async fn create_storage_directory(
+    State(state): State<AppState>,
+    Json(request): Json<CreateDirectoryRequest>,
+) -> Result<Json<DirectoryListingResponse>, ApiError> {
+    crate::storage_path::create_subdirectory(&state.download_root, &request.parent, &request.name)
+        .await
+        .map_err(ApiError::bad_request)?;
+    storage_directories(
+        State(state),
+        Query(DirectoryQuery {
+            path: Some(request.parent),
+        }),
+    )
+    .await
 }
 
 async fn devices(State(state): State<AppState>) -> Json<Vec<DiscoveredDevice>> {
@@ -199,27 +343,30 @@ async fn probe_device(
     Json(request): Json<ProbeRequest>,
 ) -> Result<Json<DiscoveredDevice>, ApiError> {
     let (ip, port) = parse_probe_address(&request.address)?;
-    let host = match ip {
-        IpAddr::V4(address) => address.to_string(),
-        IpAddr::V6(address) => format!("[{address}]"),
-    };
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(Duration::from_secs(4))
-        .build()
-        .map_err(ApiError::internal)?;
+    let host = ip.to_string();
+    let client = LsHttpClientV2::try_new(
+        &state.identity.material.private_key_pem,
+        &state.identity.material.certificate_pem,
+        None,
+        Some(Duration::from_secs(4)),
+    )
+    .map_err(ApiError::internal)?;
     let mut last_error = None;
 
     for protocol in [Protocol::Https, Protocol::Http] {
-        let url = format!("{}://{host}:{port}/api/localsend/v2/info", protocol);
-        match client.get(&url).send().await {
-            Ok(response) if response.status().is_success() => {
-                let mut device = response
-                    .json::<DeviceInfo>()
-                    .await
-                    .map_err(|error| ApiError::bad_gateway(error.to_string()))?;
-                device.ip = Some(ip.to_string());
-                device.protocol = protocol;
+        match client.info(protocol.into(), &host, port).await {
+            Ok(info) => {
+                let device = DeviceInfo {
+                    alias: info.alias,
+                    version: info.version,
+                    device_model: info.device_model,
+                    device_type: info.device_type.map(Into::into),
+                    fingerprint: info.fingerprint,
+                    port,
+                    protocol,
+                    download: info.download,
+                    ip: Some(host.clone()),
+                };
                 let seen = SeenDevice {
                     device: device.clone(),
                     last_seen: Instant::now(),
@@ -232,9 +379,6 @@ async fn probe_device(
                     .expect("device discovery lock should not be poisoned")
                     .insert(device.fingerprint.clone(), seen);
                 return Ok(Json(response));
-            }
-            Ok(response) => {
-                last_error = Some(format!("{} returned {}", url, response.status()));
             }
             Err(error) => {
                 last_error = Some(error.to_string());
@@ -258,7 +402,7 @@ fn parse_probe_address(value: &str) -> Result<(IpAddr, u16), ApiError> {
     let ip = value
         .parse::<IpAddr>()
         .map_err(|_| ApiError::bad_request("Use an IP address such as 192.168.1.50"))?;
-    Ok((ip, localsend_rs::DEFAULT_HTTP_PORT))
+    Ok((ip, 53317))
 }
 
 #[derive(Serialize)]
@@ -323,7 +467,7 @@ async fn decide_pending(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn history(State(state): State<AppState>) -> Json<Vec<localsend_rs::ReceivedFile>> {
+async fn history(State(state): State<AppState>) -> Json<Vec<ReceivedFile>> {
     let mut files = state.received_files.read().await.clone();
     files.reverse();
     Json(files)
@@ -497,6 +641,7 @@ async fn send_files(
     match result {
         Ok(files_sent) => {
             record.status = TransferStatus::Completed;
+            persist_outgoing_transfers(&state, transfer_id, &target, &uploads, "completed", None)?;
             Ok(Json(SendResponse {
                 transfer_id,
                 files_sent,
@@ -506,9 +651,45 @@ async fn send_files(
         Err(error) => {
             record.status = TransferStatus::Failed;
             record.error = Some(error.message.clone());
+            persist_outgoing_transfers(
+                &state,
+                transfer_id,
+                &target,
+                &uploads,
+                "failed",
+                Some(&error.message),
+            )?;
             Err(error)
         }
     }
+}
+
+fn persist_outgoing_transfers(
+    state: &AppState,
+    transfer_id: Uuid,
+    target: &DeviceInfo,
+    uploads: &[TempUpload],
+    status: &str,
+    error: Option<&str>,
+) -> Result<(), ApiError> {
+    let created_at_ms = Utc::now().timestamp_millis();
+    for upload in uploads {
+        state
+            .database
+            .record_transfer(&TransferRecord {
+                id: format!("{transfer_id}:{}", upload.id),
+                instance_id: state.instance_key.instance_id(),
+                direction: "outgoing".to_owned(),
+                peer_alias: target.alias.clone(),
+                file_name: upload.original_name.clone(),
+                size: upload.size,
+                status: status.to_owned(),
+                created_at_ms,
+                error: error.map(ToOwned::to_owned),
+            })
+            .map_err(ApiError::internal)?;
+    }
+    Ok(())
 }
 
 async fn perform_send(
@@ -517,15 +698,35 @@ async fn perform_send(
     pin: Option<&str>,
     uploads: &[TempUpload],
 ) -> Result<usize, ApiError> {
-    let target = normalize_target_for_client(target);
-    let client = LocalSendClient::new(state.local_device.clone());
-    let _ = client.register(&target).await;
+    let host = target
+        .ip
+        .as_deref()
+        .ok_or_else(|| ApiError::bad_request("The target device has no reachable address"))?;
+    let protocol = target.protocol.into();
+    let expected_fingerprint =
+        (target.protocol == Protocol::Https).then(|| target.fingerprint.clone());
+    let client = LsHttpClientV2::try_new(
+        &state.identity.material.private_key_pem,
+        &state.identity.material.certificate_pem,
+        expected_fingerprint,
+        None,
+    )
+    .map_err(|error| ApiError::internal(error.to_string()))?;
+    let registration = client
+        .register(
+            protocol,
+            host,
+            target.port,
+            state.local_device.to_register(),
+        )
+        .await
+        .map_err(|error| ApiError::bad_gateway(error.to_string()))?;
 
     let files = uploads
         .iter()
         .map(|upload| {
-            let metadata = FileMetadata {
-                id: upload.id.clone(),
+            let metadata = FileDto {
+                id: upload.id.0.clone(),
                 file_name: upload.original_name.clone(),
                 size: upload.size,
                 file_type: upload.content_type.clone(),
@@ -533,14 +734,28 @@ async fn perform_send(
                 preview: None,
                 metadata: None,
             };
-            (upload.id.clone(), metadata)
+            (upload.id.0.clone(), metadata)
         })
         .collect::<HashMap<_, _>>();
 
     let prepared = client
-        .prepare_upload(&target, files, pin)
+        .prepare_upload(
+            protocol,
+            host,
+            target.port,
+            registration.public_key.clone(),
+            PrepareUploadRequestDtoV2 {
+                info: state.local_device.to_register(),
+                files,
+            },
+            pin,
+            CancellationToken::new(),
+        )
         .await
         .map_err(|error| ApiError::bad_gateway(error.to_string()))?;
+    let Some(prepared) = prepared.response else {
+        return Ok(0);
+    };
     let by_id = uploads
         .iter()
         .map(|upload| (upload.id.as_str(), upload))
@@ -551,13 +766,16 @@ async fn perform_send(
             .get(file_id.as_str())
             .ok_or_else(|| ApiError::internal("Receiver accepted an unknown file"))?;
         client
-            .upload_file(
-                &target,
+            .upload(
+                protocol,
+                host,
+                target.port,
+                registration.public_key.clone(),
                 &prepared.session_id,
                 file_id,
                 token,
-                &upload.path,
-                None,
+                upload_body(FileContent::Path(upload.path.clone())),
+                CancellationToken::new(),
             )
             .await
             .map_err(|error| ApiError::bad_gateway(error.to_string()))?;
@@ -566,15 +784,9 @@ async fn perform_send(
     Ok(prepared.files.len())
 }
 
-fn normalize_target_for_client(target: &DeviceInfo) -> DeviceInfo {
-    let mut target = target.clone();
-    if let Some(ip) = target.ip.as_deref()
-        && ip.contains(':')
-        && !ip.starts_with('[')
-    {
-        target.ip = Some(format!("[{}]", ip.replace('%', "%25")));
-    }
-    target
+fn upload_body(content: FileContent) -> reqwest::Body {
+    let stream = ReceiverStream::new(content.into_receiver()).map(Ok::<Bytes, anyhow::Error>);
+    reqwest::Body::wrap_stream(stream)
 }
 
 fn safe_file_name(value: &str) -> String {

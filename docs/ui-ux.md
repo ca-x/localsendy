@@ -12,5 +12,7 @@ The primary information architecture follows official LocalSend: Send, Receive, 
 - High-frequency navigation has no entrance choreography. Press feedback uses a 120–160ms transform transition.
 - Motion is limited to loading rotation and small state transitions; `prefers-reduced-motion` removes them.
 - All touch targets are at least 44px, focus rings remain visible, and mobile content reserves space for the fixed bottom navigation.
+- The advanced-settings switch follows official LocalSend's progressive disclosure. It exposes effective server identity, encryption, multicast, and timing values without presenting read-only Docker environment values as editable controls.
+- Automatic network mode explains when one physical adapter is inactive because the same network is already covered by a preferred interface.
 
 The generated baseline is stored in `design-system/localsendy/MASTER.md`; implementation-specific decisions in this document take precedence where the generated landing-page defaults do not fit an application workspace.

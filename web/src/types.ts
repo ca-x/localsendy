@@ -16,14 +16,33 @@ export interface DeviceInfo {
 }
 
 export interface StatusResponse {
+  version: string;
   alias: string;
+  deviceType?: DeviceInfo['deviceType'];
+  deviceModel?: string;
   webAddress: string;
   localsendPort: number;
   protocol: string;
+  multicastIpv4: string;
+  multicastIpv6: string;
   dataDirectory: string;
   autoAccept: boolean;
+  discoveryIntervalSeconds: number;
+  maxUploadBytes: number;
   uptimeSeconds: number;
   nearbyDevices: number;
+}
+
+export interface StorageSettings {
+  root: string;
+  subdirectory: string;
+  resolvedPath: string;
+}
+
+export interface DirectoryListing {
+  path: string;
+  parent?: string;
+  directories: string[];
 }
 
 export type NetworkMode = 'all' | 'selected';
@@ -40,6 +59,7 @@ export interface NetworkInterfaceInfo {
   discoveryCapable: boolean;
   pointToPoint: boolean;
   selected: boolean;
+  coveredBy?: string;
 }
 
 export interface NetworkSettings {

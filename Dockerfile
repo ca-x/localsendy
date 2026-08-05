@@ -10,6 +10,8 @@ RUN npm run build
 FROM rust:1.94-bookworm AS rust-builder
 WORKDIR /source
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates ./crates
+COPY third_party ./third_party
 COPY src ./src
 COPY web ./web
 COPY --from=web-builder /source/web/dist ./web/dist
@@ -48,10 +50,12 @@ VOLUME ["/data"]
 EXPOSE 8080/tcp 53317/tcp 53317/udp
 STOPSIGNAL SIGTERM
 ENV LOCALSENDY_BIND=0.0.0.0:8080 \
-    LOCALSENDY_ALIAS=Localsendy \
+    LOCALSENDY_ALIAS_LOCALE=auto \
+    LOCALSENDY_DEVICE_TYPE=server \
     LOCALSENDY_PORT=53317 \
     LOCALSENDY_DATA_DIR=/data \
     LOCALSENDY_DOWNLOAD_DIR=/data/downloads \
+    LOCALSENDY_TEMP_DIR=/data/tmp \
     LOCALSENDY_AUTO_ACCEPT=false \
     LOCALSENDY_NETWORK_INTERFACES=all \
     RUST_LOG=localsendy=info,tower_http=info

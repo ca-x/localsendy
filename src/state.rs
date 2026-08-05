@@ -1,27 +1,34 @@
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
 
 use chrono::{DateTime, Utc};
-use localsend_rs::server::PendingTransfer;
-use localsend_rs::{DeviceInfo, ReceivedFile};
+use localsendy_core::{DeviceIdentity, DeviceInfo, PendingTransfer, ReceivedFile};
 use serde::Serialize;
 use tokio::sync::{RwLock as AsyncRwLock, mpsc};
 use uuid::Uuid;
 
 use crate::config::Config;
 use crate::network::{DiscoveryCommand, NetworkPreferences};
+use localsendy_storage::{Database, InstanceKey};
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: Config,
+    pub database: Database,
+    pub instance_key: InstanceKey,
+    pub identity: Arc<DeviceIdentity>,
     pub local_device: DeviceInfo,
     pub devices: Arc<RwLock<HashMap<String, SeenDevice>>>,
     pub pending_transfer: Arc<AsyncRwLock<Option<PendingTransfer>>>,
     pub received_files: Arc<AsyncRwLock<Vec<ReceivedFile>>>,
     pub outgoing_transfers: Arc<AsyncRwLock<Vec<OutgoingTransfer>>>,
+    pub download_root: PathBuf,
+    pub download_subdirectory: Arc<AsyncRwLock<String>>,
+    pub receiver_destination: Arc<AsyncRwLock<PathBuf>>,
     pub scan_tx: mpsc::Sender<DiscoveryCommand>,
     pub network_preferences: Arc<RwLock<NetworkPreferences>>,
     pub started_at: Instant,

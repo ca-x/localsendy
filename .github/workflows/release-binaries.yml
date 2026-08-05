@@ -1,0 +1,139 @@
+name: Release binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  web-assets:
+    name: Build embedded Web assets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Install locked Web dependencies
+        run: npm --prefix web ci --ignore-scripts
+
+      - name: Build production Web bundle
+        run: npm --prefix web run build
+
+      - name: Upload embedded Web assets
+        uses: actions/upload-artifact@v7
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
+          retention-days: 3
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: web-assets
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.94.0
+          targets: ${{ matrix.target }}
+
+      - name: Download embedded Web assets
+        uses: actions/download-artifact@v7
+        with:
+          name: web-dist
+          path: web/dist
+
+      - name: Verify tag matches package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          package_version="$(sed -n '/^\[package\]/,/^\[/ s/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n 1)"
+          test -n "${package_version}"
+          test "${GITHUB_REF_NAME}" = "v${package_version}"
+
+      - name: Build release binary
+        run: cargo build --release --locked --target "${{ matrix.target }}"
+
+      - name: Package release archive
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          package="localsendy-${TARGET}"
+          staging="dist/${package}"
+          mkdir -p "${staging}"
+          cp "target/${TARGET}/release/localsendy" "${staging}/"
+          cp README.md README.zh-CN.md LICENSE "${staging}/"
+          tar -C dist -czf "dist/${package}.tar.gz" "${package}"
+
+      - name: Upload release archive
+        uses: actions/upload-artifact@v7
+        with:
+          name: localsendy-${{ matrix.target }}
+          path: dist/localsendy-${{ matrix.target }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@v7
+        with:
+          pattern: localsendy-*
+          path: dist
+          merge-multiple: true
+
+      - name: Generate SHA-256 checksums
+        run: |
+          set -euo pipefail
+          cd dist
+          find . -maxdepth 1 -type f -name 'localsendy-*' -printf '%f\0' \
+            | sort -z \
+            | xargs -0 sha256sum > SHA256SUMS
+
+      - name: Publish tagged release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
+

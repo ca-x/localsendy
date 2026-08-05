@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { ChangeEvent, DragEvent, ReactNode } from 'react';
 import {
+  ArrowLeft,
   Check,
   ChevronRight,
   CircleAlert,
   File,
   FolderOpen,
+  FolderPlus,
   HardDrive,
   Inbox,
   Languages,
@@ -24,16 +26,20 @@ import {
   X,
 } from 'lucide-react';
 import {
+  createStorageDirectory,
   decidePending,
   getDevices,
   getHistory,
   getNetworkSettings,
   getPending,
   getStatus,
+  getStorageSettings,
   getTransfers,
   probeDevice,
   scanDevices,
   sendFiles,
+  listStorageDirectories,
+  updateStorageSettings,
   updateNetworkSettings,
 } from './api';
 import { detectLocale, messages } from './i18n';
@@ -48,6 +54,8 @@ import type {
   PendingTransfer,
   ReceivedFile,
   StatusResponse,
+  StorageSettings,
+  DirectoryListing,
   Tab,
 } from './types';
 
@@ -218,13 +226,14 @@ export default function App() {
         </nav>
         <div className="sidebar-footer">
           <StatusPill status={status} copy={copy} />
-          <span className="version-label">v0.1.0</span>
+          <span className="version-label">v{status?.version ?? '0.1.0'}</span>
         </div>
       </aside>
 
       <main id="main-content" className="main-content" tabIndex={-1}>
         <header className="topbar">
           <div className="topbar-status">
+            <img className="topbar-logo" src="/localsendy-192.png" alt="" aria-hidden="true" />
             <span className="status-dot" aria-hidden="true" />
             <span>{status?.alias ?? copy.brand}</span>
             <span className="topbar-divider" aria-hidden="true" />
@@ -305,7 +314,7 @@ export default function App() {
 function Brand({ copy }: { copy: Record<string, string> }) {
   return (
     <div className="brand-lockup">
-      <div className="brand-mark" aria-hidden="true"><SendIcon size={20} strokeWidth={2.2} /></div>
+      <img className="brand-logo" src="/localsendy-192.png" alt="" aria-hidden="true" />
       <div><strong>{copy.brand}</strong><span>{copy.tagline}</span></div>
     </div>
   );
@@ -402,12 +411,16 @@ function ReceiveView({ copy, status, pending, history, onDecision }: { copy: Rec
 }
 
 function SettingsView({ copy, locale, theme, status, onLocale, onTheme, onError, onNotice }: { copy: Record<string, string>; locale: Locale; theme: Theme; status: StatusResponse | null; onLocale: (locale: Locale) => void; onTheme: (theme: Theme) => void; onError: (message: string | null) => void; onNotice: (message: string | null) => void }) {
+  const [showAdvanced, setShowAdvanced] = useState(() => localStorage.getItem('localsendy-advanced-settings') === 'true');
   const [networks, setNetworks] = useState<NetworkSettings | null>(null);
   const [draftMode, setDraftMode] = useState<NetworkMode>('all');
   const [draftSelected, setDraftSelected] = useState<Set<string>>(new Set());
   const [draftLabels, setDraftLabels] = useState<Record<string, string>>({});
   const [isLoadingNetworks, setIsLoadingNetworks] = useState(true);
   const [isSavingNetworks, setIsSavingNetworks] = useState(false);
+  const [storage, setStorage] = useState<StorageSettings | null>(null);
+  const [isLoadingStorage, setIsLoadingStorage] = useState(true);
+  const [isStoragePickerOpen, setIsStoragePickerOpen] = useState(false);
 
   function resetNetworkDraft(next: NetworkSettings) {
     setNetworks(next);
@@ -432,9 +445,25 @@ function SettingsView({ copy, locale, theme, status, onLocale, onTheme, onError,
     return () => { active = false; };
   }, [copy.error, onError]);
 
+  useEffect(() => {
+    let active = true;
+    setIsLoadingStorage(true);
+    getStorageSettings()
+      .then((next) => {
+        if (active) setStorage(next);
+      })
+      .catch((requestError) => {
+        if (active) onError(requestError instanceof Error ? requestError.message : copy.error);
+      })
+      .finally(() => {
+        if (active) setIsLoadingStorage(false);
+      });
+    return () => { active = false; };
+  }, [copy.error, onError]);
+
   const selectableInterfaces = networks?.interfaces.filter((network) => network.discoveryCapable) ?? [];
   const selectedCount = draftMode === 'all'
-    ? selectableInterfaces.length
+    ? networks?.interfaces.filter((network) => network.selected).length ?? 0
     : selectableInterfaces.filter((network) => draftSelected.has(network.name)).length;
   const savedSelection = networks?.selectedInterfaces ?? [];
   const selectionChanged = draftMode === 'selected'
@@ -492,6 +521,14 @@ function SettingsView({ copy, locale, theme, status, onLocale, onTheme, onError,
 
   const deviceNetworks = networks?.interfaces.filter((network) => network.kind !== 'bridge' && network.kind !== 'virtual') ?? [];
   const virtualNetworks = networks?.interfaces.filter((network) => network.kind === 'bridge' || network.kind === 'virtual') ?? [];
+  const deviceTypeLabel = status?.deviceType
+    ? copy[`deviceType${status.deviceType[0].toUpperCase()}${status.deviceType.slice(1)}`]
+    : '—';
+
+  function toggleAdvanced(enabled: boolean) {
+    setShowAdvanced(enabled);
+    localStorage.setItem('localsendy-advanced-settings', String(enabled));
+  }
 
   return (
     <section className="workspace settings-workspace">
@@ -505,7 +542,35 @@ function SettingsView({ copy, locale, theme, status, onLocale, onTheme, onError,
 
         <div className="settings-section">
           <div className="section-heading"><div><h2>{copy.storage}</h2><p>{copy.downloads}</p></div><HardDrive size={21} className="section-icon" aria-hidden="true" /></div>
-          <div className="storage-path"><FolderOpen size={18} aria-hidden="true" /><code>{status?.dataDirectory ?? '/data/downloads'}</code></div>
+          <div className="storage-control">
+            <div className="storage-path"><FolderOpen size={18} aria-hidden="true" /><code>{storage?.resolvedPath ?? status?.dataDirectory ?? '/data/downloads'}</code></div>
+            <button className="secondary-button storage-choose-button" type="button" disabled={isLoadingStorage} onClick={() => setIsStoragePickerOpen(true)}>
+              {isLoadingStorage ? <RefreshCw size={17} className="spin" aria-hidden="true" /> : <FolderOpen size={17} aria-hidden="true" />}
+              {copy.chooseDirectory}
+            </button>
+          </div>
+          <p className="storage-root-hint">{copy.storageRoot}: <code>{storage?.root ?? copy.loading}</code></p>
+          <div className="setting-row readonly-setting"><div className="setting-label"><Inbox size={18} aria-hidden="true" /><span>{copy.autoAccept}</span></div><strong>{status?.autoAccept ? copy.enabled : copy.disabled}</strong></div>
+        </div>
+
+        <div className="settings-section advanced-settings-section deployment-section">
+          <label className="advanced-toggle-row">
+            <span className="network-mode-copy"><strong>{copy.advancedSettings}</strong><small>{copy.advancedSettingsHint}</small></span>
+            <span className="network-mode-meta"><input className="sr-only" type="checkbox" checked={showAdvanced} onChange={(event) => toggleAdvanced(event.target.checked)} /><span className="switch-track" aria-hidden="true"><span className="switch-thumb" /></span></span>
+          </label>
+          {showAdvanced ? <>
+            <div className="info-grid advanced-info-grid">
+              <InfoItem icon={<Server size={17} />} label={copy.alias} value={status?.alias ?? '—'} />
+              <InfoItem icon={<Monitor size={17} />} label={copy.deviceType} value={deviceTypeLabel} />
+              <InfoItem icon={<Laptop size={17} />} label={copy.deviceModel} value={status?.deviceModel ?? '—'} />
+              <InfoItem icon={<ShieldCheck size={17} />} label={copy.encryption} value={status?.protocol?.toUpperCase() ?? 'HTTPS'} />
+              <InfoItem icon={<Wifi size={17} />} label={copy.ipv4Multicast} value={status?.multicastIpv4 ?? '224.0.0.167'} />
+              <InfoItem icon={<Wifi size={17} />} label={copy.ipv6Multicast} value={status?.multicastIpv6 ?? 'ff12::fd3a:e420'} />
+              <InfoItem icon={<RefreshCw size={17} />} label={copy.discoveryInterval} value={`${status?.discoveryIntervalSeconds ?? 30} ${copy.seconds}`} />
+              <InfoItem icon={<UploadCloud size={17} />} label={copy.uploadLimit} value={formatBytes(status?.maxUploadBytes ?? 10_737_418_240)} />
+            </div>
+            <p className="advanced-settings-note">{copy.managedByEnvironment}</p>
+          </> : null}
         </div>
 
         <div className="settings-section network-settings-section deployment-section">
@@ -540,15 +605,127 @@ function SettingsView({ copy, locale, theme, status, onLocale, onTheme, onError,
           </div>
         </div>
 
-        <div className="settings-section deployment-section"><div className="section-heading"><div><h2>{copy.deployment}</h2><p>Docker</p></div><Server size={21} className="section-icon" aria-hidden="true" /></div><p className="deployment-copy">{copy.deploymentHint}</p></div>
+        <div className="settings-section deployment-section"><div className="section-heading"><div><h2>{copy.deployment}</h2><p>Docker</p></div><Server size={21} className="section-icon" aria-hidden="true" /></div><p className="deployment-copy">{copy.deploymentHint}</p><div className="setting-row readonly-setting"><div className="setting-label"><ShieldCheck size={18} aria-hidden="true" /><span>{copy.version}</span></div><strong>v{status?.version ?? '0.1.0'}</strong></div></div>
       </div>
+      {storage ? <StorageDirectoryDialog
+        open={isStoragePickerOpen}
+        storage={storage}
+        copy={copy}
+        onClose={() => setIsStoragePickerOpen(false)}
+        onSelected={(next) => {
+          setStorage(next);
+          setIsStoragePickerOpen(false);
+          onNotice(copy.storageUpdated);
+        }}
+        onError={onError}
+      /> : null}
       <div className="settings-footnote"><ShieldCheck size={15} aria-hidden="true" /> {copy.privacyFootnote}</div>
     </section>
   );
 }
 
+function StorageDirectoryDialog({ open, storage, copy, onClose, onSelected, onError }: { open: boolean; storage: StorageSettings; copy: Record<string, string>; onClose: () => void; onSelected: (storage: StorageSettings) => void; onError: (message: string | null) => void }) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const [listing, setListing] = useState<DirectoryListing | null>(null);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+  const [isCreating, setIsCreating] = useState(false);
+  const [newDirectoryName, setNewDirectoryName] = useState('');
+
+  const loadDirectory = useCallback(async (path: string) => {
+    setIsLoading(true);
+    onError(null);
+    try {
+      setListing(await listStorageDirectories(path));
+    } catch (requestError) {
+      onError(requestError instanceof Error ? requestError.message : copy.error);
+    } finally {
+      setIsLoading(false);
+    }
+  }, [copy.error, onError]);
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    if (open && !dialog.open) {
+      dialog.showModal();
+      setIsCreating(false);
+      setNewDirectoryName('');
+      void loadDirectory(storage.subdirectory);
+    } else if (!open && dialog.open) {
+      dialog.close();
+    }
+  }, [loadDirectory, open, storage.subdirectory]);
+
+  const segments = listing?.path ? listing.path.split('/') : [];
+
+  async function chooseCurrentDirectory() {
+    if (!listing) return;
+    setIsSaving(true);
+    onError(null);
+    try {
+      onSelected(await updateStorageSettings(listing.path));
+    } catch (requestError) {
+      onError(requestError instanceof Error ? requestError.message : copy.error);
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  async function createDirectory() {
+    if (!listing || !newDirectoryName.trim()) return;
+    setIsSaving(true);
+    onError(null);
+    try {
+      setListing(await createStorageDirectory(listing.path, newDirectoryName.trim()));
+      setNewDirectoryName('');
+      setIsCreating(false);
+    } catch (requestError) {
+      onError(requestError instanceof Error ? requestError.message : copy.error);
+    } finally {
+      setIsSaving(false);
+    }
+  }
+
+  return (
+    <dialog ref={dialogRef} className="directory-dialog" aria-labelledby="directory-dialog-title" onCancel={(event) => { event.preventDefault(); onClose(); }} onClose={onClose}>
+      <div className="directory-dialog-header">
+        <div><p className="eyebrow">{copy.storageRoot}</p><h2 id="directory-dialog-title">{copy.chooseDirectory}</h2></div>
+        <button className="icon-button" type="button" aria-label={copy.close} title={copy.close} onClick={onClose}><X size={18} aria-hidden="true" /></button>
+      </div>
+      <div className="directory-toolbar">
+        <button className="icon-button outlined" type="button" aria-label={copy.parentDirectory} title={copy.parentDirectory} disabled={isLoading || listing?.parent === undefined} onClick={() => listing?.parent !== undefined && void loadDirectory(listing.parent)}><ArrowLeft size={18} aria-hidden="true" /></button>
+        <nav className="directory-breadcrumbs" aria-label={copy.currentDirectory}>
+          <button type="button" onClick={() => void loadDirectory('')}>{copy.rootDirectory}</button>
+          {segments.map((segment, index) => {
+            const path = segments.slice(0, index + 1).join('/');
+            return <span key={path}><ChevronRight size={14} aria-hidden="true" /><button type="button" onClick={() => void loadDirectory(path)}>{segment}</button></span>;
+          })}
+        </nav>
+        <button className="icon-button outlined" type="button" aria-label={copy.newDirectory} title={copy.newDirectory} disabled={isLoading || isSaving} onClick={() => setIsCreating((current) => !current)}><FolderPlus size={18} aria-hidden="true" /></button>
+      </div>
+      {isCreating ? <form className="new-directory-form" onSubmit={(event) => { event.preventDefault(); void createDirectory(); }}>
+        <label htmlFor="new-directory-name">{copy.directoryName}</label>
+        <div><input id="new-directory-name" autoFocus value={newDirectoryName} onChange={(event) => setNewDirectoryName(event.target.value)} placeholder={copy.directoryNamePlaceholder} /><button className="secondary-button" type="submit" disabled={!newDirectoryName.trim() || isSaving}>{copy.create}</button></div>
+      </form> : null}
+      <div className="directory-list" aria-busy={isLoading}>
+        {isLoading ? <div className="directory-state"><RefreshCw size={20} className="spin" aria-hidden="true" /><span>{copy.loading}</span></div> : null}
+        {!isLoading && listing?.directories.length === 0 ? <div className="directory-state"><FolderOpen size={22} aria-hidden="true" /><span>{copy.noSubdirectories}</span></div> : null}
+        {!isLoading ? listing?.directories.map((directory) => {
+          const path = listing.path ? `${listing.path}/${directory}` : directory;
+          return <button className="directory-row" type="button" key={directory} onClick={() => void loadDirectory(path)}><span className="directory-icon"><FolderOpen size={19} aria-hidden="true" /></span><strong>{directory}</strong><ChevronRight size={17} aria-hidden="true" /></button>;
+        }) : null}
+      </div>
+      <div className="directory-dialog-footer">
+        <div><span>{copy.currentDirectory}</span><code>{listing?.path || copy.rootDirectory}</code></div>
+        <div><button className="secondary-button" type="button" onClick={onClose}>{copy.cancel}</button><button className="primary-button" type="button" disabled={!listing || isLoading || isSaving} onClick={() => void chooseCurrentDirectory()}>{isSaving ? <RefreshCw size={17} className="spin" aria-hidden="true" /> : <Check size={17} aria-hidden="true" />}{copy.selectCurrentDirectory}</button></div>
+      </div>
+    </dialog>
+  );
+}
+
 function NetworkInterfaceGroup({ title, hint, networks, mode, selected, labels, copy, disabled, collapsible = false, onToggle, onLabel }: { title: string; hint: string; networks: NetworkInterfaceInfo[]; mode: NetworkMode; selected: Set<string>; labels: Record<string, string>; copy: Record<string, string>; disabled: boolean; collapsible?: boolean; onToggle: (name: string) => void; onLabel: (name: string, label: string) => void }) {
-  const rows = <div className="network-interface-grid">{networks.map((network) => <NetworkInterfaceRow key={network.name} network={network} mode={mode} selected={selected.has(network.name)} label={labels[network.name] ?? ''} copy={copy} disabled={disabled} onToggle={() => onToggle(network.name)} onLabel={(label) => onLabel(network.name, label)} />)}</div>;
+  const rows = <div className="network-interface-grid">{networks.map((network) => <NetworkInterfaceRow key={network.name} network={network} mode={mode} selected={mode === 'all' ? network.selected : selected.has(network.name)} label={labels[network.name] ?? ''} copy={copy} disabled={disabled} onToggle={() => onToggle(network.name)} onLabel={(label) => onLabel(network.name, label)} />)}</div>;
   const heading = <div className="network-group-heading"><div><h3>{title}</h3><p>{hint}</p></div><span>{networks.length}</span></div>;
   if (collapsible) {
     return <details className="network-group collapsible" open={mode === 'selected' && networks.some((network) => selected.has(network.name)) ? true : undefined}><summary><ChevronRight size={16} aria-hidden="true" />{heading}</summary>{rows}</details>;
@@ -557,13 +734,15 @@ function NetworkInterfaceGroup({ title, hint, networks, mode, selected, labels, 
 }
 
 function NetworkInterfaceRow({ network, mode, selected, label, copy, disabled, onToggle, onLabel }: { network: NetworkInterfaceInfo; mode: NetworkMode; selected: boolean; label: string; copy: Record<string, string>; disabled: boolean; onToggle: () => void; onLabel: (label: string) => void }) {
-  const checked = network.discoveryCapable && (mode === 'all' || selected);
+  const checked = network.discoveryCapable && selected;
   const controlDisabled = disabled || mode === 'all' || !network.discoveryCapable;
   const Icon = network.kind === 'wifi' ? Wifi : network.kind === 'bridge' || network.kind === 'virtual' ? Server : network.kind === 'tunnel' ? ShieldCheck : Monitor;
   const kindLabel = copy[`interfaceKind${network.kind[0].toUpperCase()}${network.kind.slice(1)}`];
-  const capability = network.ipv4Discovery && network.ipv6Discovery ? copy.dualStackMulticast : network.ipv6Discovery ? copy.ipv6Multicast : network.ipv4Discovery ? copy.ipv4Multicast : network.pointToPoint ? copy.pointToPoint : copy.manualOnly;
+  const capability = network.coveredBy && mode === 'all'
+    ? copy.sameNetworkCovered.replace('{interface}', network.coveredBy)
+    : network.ipv4Discovery && network.ipv6Discovery ? copy.dualStackMulticast : network.ipv6Discovery ? copy.ipv6Multicast : network.ipv4Discovery ? copy.ipv4Multicast : network.pointToPoint ? copy.pointToPoint : copy.manualOnly;
   return (
-    <div className={`network-interface-row ${checked ? 'selected' : ''} ${mode === 'all' ? 'automatic' : ''} ${!network.discoveryCapable ? 'manual-only' : ''}`} title={!network.discoveryCapable ? copy.manualOnlyHint : undefined}>
+    <div className={`network-interface-row ${checked ? 'selected' : ''} ${mode === 'all' ? 'automatic' : ''} ${network.coveredBy && mode === 'all' ? 'covered' : ''} ${!network.discoveryCapable ? 'manual-only' : ''}`} title={!network.discoveryCapable ? copy.manualOnlyHint : undefined}>
       <span className="network-interface-icon"><Icon size={18} strokeWidth={1.8} aria-hidden="true" /></span>
       <span className="network-interface-content">
         <span className="network-interface-title"><strong>{network.name}</strong><span>{kindLabel}</span></span>

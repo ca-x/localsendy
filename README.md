@@ -11,11 +11,13 @@ Localsendy is a Docker-first LocalSend node with a responsive web interface. The
 
 - LocalSend v2 HTTPS receiver powered by [`localsend-rs`](https://github.com/CrossCopy/localsend-rs)
 - Automatic multi-interface IPv4/IPv6 UDP multicast discovery with optional advanced filtering
+- Automatic Ethernet-over-Wi-Fi preference when both adapters reach the same network, with runtime failover
 - Multi-file sending to discovered LocalSend devices
 - Explicit accept/decline flow or opt-in automatic acceptance
 - Receive history and outgoing transfer status
 - Responsive Send / Receive / Settings navigation based on the official LocalSend information architecture
 - English, Simplified Chinese, and Traditional Chinese UI foundations
+- Persistent official-style localized random device names with configurable prefix, type, and model
 - Light, dark, and system themes with reduced-motion and keyboard support
 - Non-root multi-stage Docker image and GHCR publishing workflow
 
@@ -29,7 +31,7 @@ docker compose up -d
 
 Open `http://<server-ip>:8080`. Received files are written to `./data/downloads`.
 
-To use a different name:
+The first start creates a persistent official-style random identity in `/data/device-identity.json`. To use a fixed name instead:
 
 ```bash
 LOCALSENDY_ALIAS="Home NAS" docker compose up -d
@@ -41,6 +43,8 @@ LocalSend multicast discovery stays inside the same broadcast domain. On routed 
 
 With Linux host networking, Localsendy automatically monitors every eligible host interface; there is nothing to select for normal use. Newly available Ethernet, Wi-Fi, bridge, VPN, and tunnel interfaces are detected at runtime. Advanced settings can restrict discovery to specific interfaces and attach human-readable labels. Discovery supports the LocalSend IPv4 group `224.0.0.167` and IPv6 group `ff12::fd3a:e420`, including ULA networks such as `fc00::/7` when the network carries IPv6 multicast.
 
+When Ethernet and Wi-Fi have the same non-link-local network prefix, automatic mode announces through Ethernet only. If Ethernet disappears, the five-second interface refresh activates Wi-Fi. Tunnels, Docker bridges, and virtual interfaces stay independent even when their prefixes overlap.
+
 Network preferences and interface labels are saved to `/data/network-settings.json`. `LOCALSENDY_NETWORK_INTERFACES` is used as the initial fallback when no persisted settings exist.
 
 ## Configuration
@@ -48,15 +52,26 @@ Network preferences and interface labels are saved to `/data/network-settings.js
 | Variable | Default | Purpose |
 | --- | --- | --- |
 | `LOCALSENDY_BIND` | `0.0.0.0:8080` | Web UI and control API bind address |
-| `LOCALSENDY_ALIAS` | `Localsendy` | Device name shown to LocalSend peers |
+| `LOCALSENDY_ALIAS` | unset | Fixed device name; overrides generated names and prefixes |
+| `LOCALSENDY_ALIAS_PREFIX` | unset | Prefix added to the generated localized name |
+| `LOCALSENDY_ALIAS_LOCALE` | `auto` | Generated-name locale: `auto`, `en`, `zh-CN`, or `zh-TW`; `auto` follows `LC_ALL`/`LANG` |
+| `LOCALSENDY_DEVICE_TYPE` | `server` | Standard LocalSend type: `mobile`, `desktop`, `web`, `headless`, or `server` |
+| `LOCALSENDY_DEVICE_MODEL` | detected OS | Arbitrary display model shown to peers, such as `Linux`, `Windows`, or a product name |
 | `LOCALSENDY_PORT` | `53317` | LocalSend HTTPS and discovery port |
 | `LOCALSENDY_DATA_DIR` | `/data` | Persistent storage root |
 | `LOCALSENDY_DOWNLOAD_DIR` | `/data/downloads` | Directory for received files; overrides the data-root default |
+| `LOCALSENDY_TEMP_DIR` | `/data/tmp` | Temporary workspace for runtime data |
 | `LOCALSENDY_AUTO_ACCEPT` | `false` | Accept inbound transfers without browser approval |
 | `LOCALSENDY_DISCOVERY_INTERVAL_SECONDS` | `30` | Presence announcement interval, minimum 5 seconds |
 | `LOCALSENDY_NETWORK_INTERFACES` | `all` | Initial fallback: `all`, `*`, or a comma-separated interface list; persisted UI settings take precedence |
 | `LOCALSENDY_MAX_UPLOAD_BYTES` | `10737418240` | Maximum total size of one browser send request |
 | `RUST_LOG` | `localsendy=info,tower_http=info` | Rust tracing filter |
+
+Alias, device type, device model, and port are startup identity values. Change the environment and restart the container to apply them, matching LocalSend's server-restart behavior.
+
+## Current protocol boundaries
+
+Localsendy exposes only settings that the current service can enforce. Automatic acceptance and the save directory are supported. PIN validation, favorite-device trust rules, share-by-link, and configurable multicast groups are not implemented by the current `localsend-rs` integration and are intentionally not shown as working controls.
 
 ## Local development
 
@@ -109,7 +124,6 @@ See [docs/architecture.md](docs/architecture.md) and the persisted [design syste
 - Text messages and share-by-link mode
 - Transfer progress events and cancellation
 - Persistent history with retention controls
-- PIN-protected receiving and trusted-device policies
 - Additional official LocalSend locale coverage
 
 ## Attribution

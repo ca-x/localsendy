@@ -9,22 +9,18 @@ use std::{
 
 use anyhow::{Context, Result};
 use if_addrs::{IfAddr, Interface, get_if_addrs};
-use localsend_rs::{
-    AnnouncementMessage, DEFAULT_MULTICAST_ADDRESS, DEFAULT_MULTICAST_PORT, DeviceInfo,
-};
+use localsendy_core::{AnnouncementMessage, DeviceInfo};
 use serde::{Deserialize, Serialize};
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
-use tokio::{
-    io::copy_bidirectional,
-    net::{TcpListener, TcpStream, UdpSocket},
-    sync::mpsc,
-    task::JoinHandle,
-};
+use tokio::{net::UdpSocket, sync::mpsc, task::JoinHandle};
 use tracing::{debug, info, warn};
 
 use crate::state::SeenDevice;
 
-const DEFAULT_MULTICAST_GROUP_V6: Ipv6Addr = Ipv6Addr::new(0xff12, 0, 0, 0, 0, 0, 0xfd3a, 0xe420);
+pub const DEFAULT_MULTICAST_GROUP_V6: Ipv6Addr =
+    Ipv6Addr::new(0xff12, 0, 0, 0, 0, 0, 0xfd3a, 0xe420);
+pub const DEFAULT_MULTICAST_ADDRESS: &str = "224.0.0.167";
+pub const DEFAULT_MULTICAST_PORT: u16 = 53317;
 const INTERFACE_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
@@ -127,6 +123,7 @@ pub struct NetworkInterfaceInfo {
     pub discovery_capable: bool,
     pub point_to_point: bool,
     pub selected: bool,
+    pub covered_by: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -168,23 +165,42 @@ impl InterfaceRecord {
                 .iter()
                 .any(|(address, _)| !address.is_unicast_link_local())
     }
+
+    fn network_keys(&self) -> BTreeSet<NetworkKey> {
+        let ipv4 = self
+            .ipv4
+            .iter()
+            .filter(|(address, _)| !address.is_link_local())
+            .map(|(address, prefix)| NetworkKey::V4 {
+                network: masked_v4(*address, *prefix),
+                prefix: (*prefix).min(32),
+            });
+        let ipv6 = self
+            .ipv6
+            .iter()
+            .filter(|(address, _)| !address.is_unicast_link_local())
+            .map(|(address, prefix)| NetworkKey::V6 {
+                network: masked_v6(*address, *prefix),
+                prefix: (*prefix).min(128),
+            });
+        ipv4.chain(ipv6).collect()
+    }
 }
 
 pub fn network_settings(preferences: &NetworkPreferences) -> io::Result<NetworkSettings> {
     let records = interface_records(get_if_addrs()?);
-    let mut active_discovery_interfaces = Vec::new();
+    let plan = discovery_plan(&records, preferences);
+    let active_discovery_interfaces = plan.active_interfaces.iter().cloned().collect();
     let interfaces = records
         .into_iter()
         .map(|record| {
             let ipv4_discovery = record.ipv4_discovery();
             let ipv6_discovery = record.ipv6_discovery();
             let discovery_capable = ipv4_discovery || ipv6_discovery;
-            let selected = discovery_capable && preferences.includes(&record.name);
-            if selected {
-                active_discovery_interfaces.push(record.name.clone());
-            }
+            let selected = plan.active_interfaces.contains(&record.name);
             NetworkInterfaceInfo {
                 label: preferences.labels.get(&record.name).cloned(),
+                covered_by: plan.covered_by.get(&record.name).cloned(),
                 name: record.name,
                 kind: record.kind,
                 ipv4_addresses: record
@@ -205,8 +221,6 @@ pub fn network_settings(preferences: &NetworkPreferences) -> io::Result<NetworkS
             }
         })
         .collect();
-    active_discovery_interfaces.sort();
-    active_discovery_interfaces.dedup();
 
     Ok(NetworkSettings {
         mode: preferences.selection.mode,
@@ -220,6 +234,18 @@ pub fn network_settings(preferences: &NetworkPreferences) -> io::Result<NetworkS
 enum DiscoveryEndpoint {
     V4 { name: String, address: Ipv4Addr },
     V6 { name: String, index: u32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum NetworkKey {
+    V4 { network: u32, prefix: u8 },
+    V6 { network: u128, prefix: u8 },
+}
+
+struct DiscoveryPlan {
+    endpoints: Vec<DiscoveryEndpoint>,
+    active_interfaces: BTreeSet<String>,
+    covered_by: BTreeMap<String, String>,
 }
 
 impl DiscoveryEndpoint {
@@ -242,35 +268,111 @@ impl DiscoveryEndpoint {
 }
 
 fn selected_endpoints(preferences: &NetworkPreferences) -> io::Result<Vec<DiscoveryEndpoint>> {
+    let records = interface_records(get_if_addrs()?);
+    Ok(discovery_plan(&records, preferences).endpoints)
+}
+
+fn discovery_plan(records: &[InterfaceRecord], preferences: &NetworkPreferences) -> DiscoveryPlan {
     let mut endpoints = Vec::new();
-    for record in interface_records(get_if_addrs()?) {
+    let mut active_interfaces = BTreeSet::new();
+    let mut covered_by = BTreeMap::new();
+    let mut covered_networks = BTreeMap::<NetworkKey, String>::new();
+    let mut ordered = records.iter().collect::<Vec<_>>();
+    ordered.sort_by_key(|record| (interface_priority(record.kind), record.name.as_str()));
+
+    for record in ordered {
         if !preferences.includes(&record.name) {
             continue;
         }
-        if record.ipv4_discovery() {
-            endpoints.extend(
-                record
-                    .ipv4
-                    .iter()
-                    .filter(|(address, _)| !address.is_link_local())
-                    .map(|(address, _)| DiscoveryEndpoint::V4 {
-                        name: record.name.clone(),
-                        address: *address,
-                    }),
-            );
+
+        if preferences.selection.mode == NetworkMode::All && record.kind.is_physical() {
+            let keys = record.network_keys();
+            if !keys.is_empty() && keys.iter().all(|key| covered_networks.contains_key(key)) {
+                if let Some(owner) = keys.iter().find_map(|key| covered_networks.get(key)) {
+                    covered_by.insert(record.name.clone(), owner.clone());
+                }
+                continue;
+            }
+            for key in keys {
+                covered_networks
+                    .entry(key)
+                    .or_insert_with(|| record.name.clone());
+            }
         }
-        if record.ipv6_discovery()
-            && let Some(index) = record.index
-        {
-            endpoints.push(DiscoveryEndpoint::V6 {
-                name: record.name,
-                index,
-            });
+
+        let before = endpoints.len();
+        append_record_endpoints(&mut endpoints, record);
+        if endpoints.len() > before {
+            active_interfaces.insert(record.name.clone());
         }
     }
     endpoints.sort_by_key(DiscoveryEndpoint::description);
     endpoints.dedup();
-    Ok(endpoints)
+    DiscoveryPlan {
+        endpoints,
+        active_interfaces,
+        covered_by,
+    }
+}
+
+fn append_record_endpoints(endpoints: &mut Vec<DiscoveryEndpoint>, record: &InterfaceRecord) {
+    if record.ipv4_discovery() {
+        endpoints.extend(
+            record
+                .ipv4
+                .iter()
+                .filter(|(address, _)| !address.is_link_local())
+                .map(|(address, _)| DiscoveryEndpoint::V4 {
+                    name: record.name.clone(),
+                    address: *address,
+                }),
+        );
+    }
+    if record.ipv6_discovery()
+        && let Some(index) = record.index
+    {
+        endpoints.push(DiscoveryEndpoint::V6 {
+            name: record.name.clone(),
+            index,
+        });
+    }
+}
+
+impl InterfaceKind {
+    fn is_physical(self) -> bool {
+        matches!(self, Self::Ethernet | Self::Wifi)
+    }
+}
+
+fn interface_priority(kind: InterfaceKind) -> u8 {
+    match kind {
+        InterfaceKind::Ethernet => 0,
+        InterfaceKind::Wifi => 1,
+        InterfaceKind::Other => 2,
+        InterfaceKind::Tunnel => 3,
+        InterfaceKind::Bridge => 4,
+        InterfaceKind::Virtual => 5,
+    }
+}
+
+fn masked_v4(address: Ipv4Addr, prefix: u8) -> u32 {
+    let prefix = prefix.min(32);
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u32::MAX << (32 - prefix)
+    };
+    u32::from(address) & mask
+}
+
+fn masked_v6(address: Ipv6Addr, prefix: u8) -> u128 {
+    let prefix = prefix.min(128);
+    let mask = if prefix == 0 {
+        0
+    } else {
+        u128::MAX << (128 - prefix)
+    };
+    u128::from(address) & mask
 }
 
 fn interface_records(interfaces: Vec<Interface>) -> Vec<InterfaceRecord> {
@@ -321,11 +423,7 @@ fn interface_kind(name: &str) -> InterfaceKind {
         InterfaceKind::Wifi
     } else if name.starts_with("en") || name.starts_with("eth") {
         InterfaceKind::Ethernet
-    } else if name.starts_with("br")
-        || name.starts_with("docker")
-        || name.starts_with("virbr")
-        || name.starts_with("lzc-br")
-    {
+    } else if name.starts_with("br") || name.starts_with("docker") || name.starts_with("virbr") {
         InterfaceKind::Bridge
     } else if name.starts_with("tun")
         || name.starts_with("tap")
@@ -361,7 +459,7 @@ struct ReceivedDatagram {
 }
 
 pub async fn run_discovery(
-    local_device: DeviceInfo,
+    local_devices: Arc<RwLock<Vec<DeviceInfo>>>,
     devices: Arc<RwLock<HashMap<String, SeenDevice>>>,
     preferences: Arc<RwLock<NetworkPreferences>>,
     mut commands: mpsc::Receiver<DiscoveryCommand>,
@@ -385,11 +483,12 @@ pub async fn run_discovery(
         tokio::select! {
             datagram = datagram_rx.recv() => {
                 let Some(datagram) = datagram else { break };
+                let device_snapshot = local_device_snapshot(&local_devices);
                 if let Some((should_respond, source_interface)) = handle_announcement(
                     &datagram.payload,
                     datagram.source,
                     datagram.endpoint.name(),
-                    &local_device,
+                    &device_snapshot,
                     &devices,
                 )
                     && should_respond
@@ -401,9 +500,9 @@ pub async fn run_discovery(
                         })
                         .cloned()
                 {
-                    let response_device = local_device.clone();
+                    let response_devices = device_snapshot;
                     tokio::spawn(async move {
-                        send_announcement(&response_device, &[response_socket], false).await;
+                        send_announcements(&response_devices, &[response_socket], false).await;
                     });
                 }
             }
@@ -416,7 +515,7 @@ pub async fn run_discovery(
                     &mut receive_tasks,
                     &datagram_tx,
                 )?;
-                send_announcement(&local_device, &sockets, true).await;
+                send_announcements(&local_device_snapshot(&local_devices), &sockets, true).await;
             }
             _ = interface_refresh.tick() => {
                 if refresh_sockets_if_needed(
@@ -427,7 +526,7 @@ pub async fn run_discovery(
                     &mut receive_tasks,
                     &datagram_tx,
                 )? {
-                    send_announcement(&local_device, &sockets, true).await;
+                    send_announcements(&local_device_snapshot(&local_devices), &sockets, true).await;
                 }
             }
             command = commands.recv() => {
@@ -441,7 +540,7 @@ pub async fn run_discovery(
                             &mut receive_tasks,
                             &datagram_tx,
                         )?;
-                        send_announcement(&local_device, &sockets, true).await;
+                        send_announcements(&local_device_snapshot(&local_devices), &sockets, true).await;
                     }
                     Some(DiscoveryCommand::Reconfigure) => {
                         endpoints = current_selected_endpoints(&preferences)?;
@@ -452,7 +551,7 @@ pub async fn run_discovery(
                             &mut receive_tasks,
                             &datagram_tx,
                         );
-                        send_announcement(&local_device, &sockets, true).await;
+                        send_announcements(&local_device_snapshot(&local_devices), &sockets, true).await;
                     }
                     None => break,
                 }
@@ -628,11 +727,14 @@ fn handle_announcement(
     payload: &[u8],
     source: SocketAddr,
     source_interface: &str,
-    local_device: &DeviceInfo,
+    local_devices: &[DeviceInfo],
     devices: &Arc<RwLock<HashMap<String, SeenDevice>>>,
 ) -> Option<(bool, String)> {
     let announcement = serde_json::from_slice::<AnnouncementMessage>(payload).ok()?;
-    if announcement.fingerprint == local_device.fingerprint {
+    if local_devices
+        .iter()
+        .any(|device| announcement.fingerprint == device.fingerprint)
+    {
         return None;
     }
     let host = match source {
@@ -686,6 +788,23 @@ fn handle_announcement(
         announcement.announce || announcement.announcement.unwrap_or(false),
         source_interface,
     ))
+}
+
+fn local_device_snapshot(local_devices: &Arc<RwLock<Vec<DeviceInfo>>>) -> Vec<DeviceInfo> {
+    local_devices
+        .read()
+        .expect("local devices lock should not be poisoned")
+        .clone()
+}
+
+async fn send_announcements(
+    local_devices: &[DeviceInfo],
+    sockets: &[BoundDiscoverySocket],
+    announce: bool,
+) {
+    for device in local_devices {
+        send_announcement(device, sockets, announce).await;
+    }
 }
 
 fn interface_name_by_index(index: u32) -> Option<String> {
@@ -759,36 +878,14 @@ pub fn route_interface_for_ip(target: IpAddr) -> io::Result<Option<String>> {
         .map(|interface| interface.name))
 }
 
-pub async fn run_ipv6_tcp_proxy(port: u16) -> Result<()> {
-    let socket = Socket::new(Domain::IPV6, Type::STREAM, Some(SocketProtocol::TCP))?;
-    socket.set_only_v6(true)?;
-    socket.set_reuse_address(true)?;
-    socket.bind(&SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0)).into())?;
-    socket.listen(128)?;
-    socket.set_nonblocking(true)?;
-    let listener = TcpListener::from_std(socket.into())?;
-    info!(port, "LocalSend IPv6 proxy is ready");
-
-    loop {
-        let (mut inbound, source) = listener.accept().await?;
-        tokio::spawn(async move {
-            match TcpStream::connect((Ipv4Addr::LOCALHOST, port)).await {
-                Ok(mut upstream) => {
-                    if let Err(error) = copy_bidirectional(&mut inbound, &mut upstream).await {
-                        debug!(%source, %error, "IPv6 LocalSend proxy connection ended");
-                    }
-                }
-                Err(error) => warn!(%source, %error, "failed to connect IPv6 proxy upstream"),
-            }
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
+    use std::{collections::BTreeSet, net::Ipv4Addr};
 
-    use super::{InterfaceKind, NetworkMode, NetworkSelection, interface_kind};
+    use super::{
+        DiscoveryEndpoint, InterfaceKind, InterfaceRecord, NetworkMode, NetworkPreferences,
+        NetworkSelection, discovery_plan, interface_kind,
+    };
 
     #[test]
     fn classifies_common_host_interfaces() {
@@ -807,5 +904,62 @@ mod tests {
         let selected = NetworkSelection::selected(BTreeSet::from(["wlp129s0".to_owned()]));
         assert!(!selected.includes("enp2s0"));
         assert!(selected.includes("wlp129s0"));
+    }
+
+    #[test]
+    fn automatic_mode_prefers_ethernet_for_same_physical_network() {
+        let records = vec![
+            InterfaceRecord {
+                name: "wlp129s0".to_owned(),
+                index: Some(3),
+                kind: InterfaceKind::Wifi,
+                ipv4: vec![(Ipv4Addr::new(10, 10, 68, 174), 24)],
+                ipv6: Vec::new(),
+                point_to_point: false,
+            },
+            InterfaceRecord {
+                name: "enp2s0".to_owned(),
+                index: Some(2),
+                kind: InterfaceKind::Ethernet,
+                ipv4: vec![(Ipv4Addr::new(10, 10, 68, 166), 24)],
+                ipv6: Vec::new(),
+                point_to_point: false,
+            },
+        ];
+        let plan = discovery_plan(&records, &NetworkPreferences::new(NetworkSelection::all()));
+
+        assert!(plan.active_interfaces.contains("enp2s0"));
+        assert!(!plan.active_interfaces.contains("wlp129s0"));
+        assert_eq!(plan.covered_by.get("wlp129s0"), Some(&"enp2s0".to_owned()));
+        assert!(plan.endpoints.iter().all(|endpoint| {
+            matches!(endpoint, DiscoveryEndpoint::V4 { name, .. } if name == "enp2s0")
+        }));
+    }
+
+    #[test]
+    fn automatic_mode_keeps_tunnels_with_overlapping_prefixes() {
+        let records = vec![
+            InterfaceRecord {
+                name: "heiyu-0".to_owned(),
+                index: Some(4),
+                kind: InterfaceKind::Tunnel,
+                ipv4: Vec::new(),
+                ipv6: vec![("fc03:1136:3859:31bd:b1c0:76b8:11de:0".parse().unwrap(), 40)],
+                point_to_point: true,
+            },
+            InterfaceRecord {
+                name: "heiyu-1".to_owned(),
+                index: Some(5),
+                kind: InterfaceKind::Tunnel,
+                ipv4: Vec::new(),
+                ipv6: vec![("fc03:1136:3841:24f9:3403:bd17:dd44:0".parse().unwrap(), 40)],
+                point_to_point: true,
+            },
+        ];
+        let plan = discovery_plan(&records, &NetworkPreferences::new(NetworkSelection::all()));
+
+        assert!(plan.active_interfaces.contains("heiyu-0"));
+        assert!(plan.active_interfaces.contains("heiyu-1"));
+        assert!(plan.covered_by.is_empty());
     }
 }

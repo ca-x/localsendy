@@ -1,0 +1,21 @@
+[package]
+name = "localsendy-core"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+description = "LocalSend protocol and instance primitives used by Localsendy"
+
+[dependencies]
+anyhow = "1.0.100"
+chrono = "0.4.43"
+localsend = { path = "../../third_party/localsend-core", features = ["crypto", "discovery", "http", "multicast"] }
+pem = "4.0.0"
+rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "ring"] }
+serde = { version = "1.0.228", features = ["derive"] }
+tokio = { version = "1.49.0", features = ["fs", "macros", "rt-multi-thread", "sync"] }
+tracing = "0.1.44"
+uuid = { version = "1.19.0", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.23.0"
