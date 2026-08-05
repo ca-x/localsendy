@@ -20,8 +20,8 @@ use localsendy_core::{
 };
 use localsendy_storage::{Database, InstanceDefaults, InstanceKey, SettingScope, TransferRecord};
 use network::{DiscoveryCommand, NetworkPreferences, run_discovery};
-use state::{AppState, SeenDevice};
-use tokio::sync::{RwLock as AsyncRwLock, mpsc};
+use state::{AppState, SeenDevice, restore_outgoing_transfers};
+use tokio::sync::{RwLock as AsyncRwLock, Semaphore, mpsc};
 use tower_http::{
     catch_panic::CatchPanicLayer, compression::CompressionLayer,
     set_header::SetResponseHeaderLayer, trace::TraceLayer,
@@ -48,13 +48,15 @@ async fn main() -> Result<()> {
     })?;
     config.alias = instance.alias.clone();
     config.localsend_port = instance.port;
-
     tokio::fs::create_dir_all(config.downloads_dir())
         .await
         .context("failed to create downloads directory")?;
     tokio::fs::create_dir_all(config.temp_dir())
         .await
         .context("failed to create temporary upload directory")?;
+    api::cleanup_stale_temp_uploads(&config.temp_dir())
+        .await
+        .context("failed to clean stale temporary uploads")?;
 
     let download_root = config.downloads_dir();
     let configured_subdirectory = database
@@ -85,6 +87,7 @@ async fn main() -> Result<()> {
 
     let devices = Arc::new(RwLock::new(HashMap::<String, SeenDevice>::new()));
     let pending_transfer = Arc::new(AsyncRwLock::new(None::<PendingTransfer>));
+    let incoming_transfers = Arc::new(AsyncRwLock::new(Vec::new()));
     let existing_received = database
         .list_transfers(&instance_key, 500)?
         .into_iter()
@@ -98,17 +101,24 @@ async fn main() -> Result<()> {
                 .to_rfc3339(),
         })
         .collect::<Vec<_>>();
+    let existing_outgoing = restore_outgoing_transfers(database.list_transfer_batches(
+        &instance_key,
+        "outgoing",
+        100,
+    )?);
     let received_files = Arc::new(AsyncRwLock::new(existing_received));
     let (received_tx, mut received_rx) = mpsc::channel::<ReceivedFile>(32);
     let received_database = database.clone();
     let received_instance_id = instance.instance_id.clone();
     tokio::spawn(async move {
         while let Some(received) = received_rx.recv().await {
+            let transfer_id = uuid::Uuid::new_v4().to_string();
             let created_at_ms = chrono::DateTime::parse_from_rfc3339(&received.time)
                 .map(|time| time.timestamp_millis())
                 .unwrap_or_else(|_| chrono::Utc::now().timestamp_millis());
             if let Err(error) = received_database.record_transfer(&TransferRecord {
-                id: uuid::Uuid::new_v4().to_string(),
+                id: transfer_id.clone(),
+                batch_id: transfer_id,
                 instance_id: received_instance_id.clone(),
                 direction: "incoming".to_owned(),
                 peer_alias: received.sender,
@@ -117,6 +127,8 @@ async fn main() -> Result<()> {
                 status: "completed".to_owned(),
                 created_at_ms,
                 error: None,
+                content_type: None,
+                is_clipboard: false,
             }) {
                 warn!(%error, "failed to persist incoming transfer");
             }
@@ -125,12 +137,13 @@ async fn main() -> Result<()> {
     let receiver = start_receiver(
         &identity,
         local_device.clone(),
-        config.auto_accept,
         config.max_upload_bytes,
         ReceiverState {
             pending_transfer: pending_transfer.clone(),
             received_files: received_files.clone(),
+            incoming_transfers: incoming_transfers.clone(),
             destination: receiver_destination.clone(),
+            auto_accept: config.auto_accept,
             completed_tx: Some(received_tx),
         },
     )
@@ -169,7 +182,9 @@ async fn main() -> Result<()> {
         devices,
         pending_transfer,
         received_files,
-        outgoing_transfers: Arc::new(AsyncRwLock::new(Vec::new())),
+        incoming_transfers,
+        outgoing_transfers: Arc::new(AsyncRwLock::new(existing_outgoing)),
+        send_semaphore: Arc::new(Semaphore::new(api::MAX_CONCURRENT_SENDS)),
         download_root,
         download_subdirectory,
         receiver_destination,

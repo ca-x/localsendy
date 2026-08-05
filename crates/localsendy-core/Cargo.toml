@@ -1,6 +1,6 @@
 [package]
 name = "localsendy-core"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.97"
 license = "MIT"
@@ -13,9 +13,10 @@ localsend = { path = "../../third_party/localsend-core", features = ["crypto", "
 pem = "4.0.0"
 rcgen = { version = "0.14.8", default-features = false, features = ["crypto", "pem", "ring"] }
 serde = { version = "1.0.228", features = ["derive"] }
-tokio = { version = "1.49.0", features = ["fs", "macros", "rt-multi-thread", "sync"] }
+tokio = { version = "1.49.0", features = ["fs", "macros", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1.44"
 uuid = { version = "1.19.0", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3.23.0"
+tokio = { version = "1.49.0", features = ["test-util"] }

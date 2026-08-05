@@ -47,9 +47,9 @@ COPY --from=rust-builder --chown=10001:10001 /tmp/localsendy /usr/local/bin/loca
 
 USER 10001:10001
 VOLUME ["/data"]
-EXPOSE 8080/tcp 53317/tcp 53317/udp
+EXPOSE 52222/tcp 53317/tcp 53317/udp
 STOPSIGNAL SIGTERM
-ENV LOCALSENDY_BIND=0.0.0.0:8080 \
+ENV LOCALSENDY_BIND=0.0.0.0:52222 \
     LOCALSENDY_ALIAS_LOCALE=auto \
     LOCALSENDY_DEVICE_TYPE=server \
     LOCALSENDY_PORT=53317 \
@@ -60,5 +60,5 @@ ENV LOCALSENDY_BIND=0.0.0.0:8080 \
     LOCALSENDY_NETWORK_INTERFACES=all \
     RUST_LOG=localsendy=info,tower_http=info
 HEALTHCHECK --interval=30s --timeout=5s --start-period=8s --retries=3 \
-  CMD ["curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:8080/api/v1/health"]
+  CMD ["curl", "--fail", "--silent", "--show-error", "http://127.0.0.1:52222/api/v1/health"]
 ENTRYPOINT ["/usr/local/bin/localsendy"]

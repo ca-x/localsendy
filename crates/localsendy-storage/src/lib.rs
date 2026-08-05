@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 4;
 pub const SINGLE_USER_SUBJECT: &str = "single";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,6 +73,7 @@ pub struct InstanceRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TransferRecord {
     pub id: String,
+    pub batch_id: String,
     pub instance_id: String,
     pub direction: String,
     pub peer_alias: String,
@@ -81,6 +82,8 @@ pub struct TransferRecord {
     pub status: String,
     pub created_at_ms: i64,
     pub error: Option<String>,
+    pub content_type: Option<String>,
+    pub is_clipboard: bool,
 }
 
 impl Database {
@@ -93,7 +96,7 @@ impl Database {
             .with_context(|| format!("failed to open SQLite database {}", path.display()))?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch(
-            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;",
+            "PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON; PRAGMA secure_delete = ON;",
         )?;
         migrate(&mut connection)?;
         Ok(Self {
@@ -196,30 +199,52 @@ impl Database {
     }
 
     pub fn record_transfer(&self, transfer: &TransferRecord) -> Result<()> {
-        let size = i64::try_from(transfer.size).context("transfer size exceeds SQLite range")?;
-        self.lock()?.execute(
-            r#"
-            INSERT INTO transfers (
-                id, instance_id, direction, peer_alias, file_name, size,
-                status, created_at_ms, error
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            ON CONFLICT(id) DO UPDATE SET
-                status = excluded.status,
-                error = excluded.error
-            "#,
-            params![
-                transfer.id,
-                transfer.instance_id,
-                transfer.direction,
-                transfer.peer_alias,
-                transfer.file_name,
-                size,
-                transfer.status,
-                transfer.created_at_ms,
-                transfer.error,
-            ],
-        )?;
+        let connection = self.lock()?;
+        upsert_transfer(&connection, transfer)
+    }
+
+    pub fn record_transfers(&self, transfers: &[TransferRecord]) -> Result<()> {
+        let mut connection = self.lock()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for transfer in transfers {
+            upsert_transfer(&transaction, transfer)?;
+        }
+        transaction.commit()?;
         Ok(())
+    }
+
+    pub fn list_transfer_batches(
+        &self,
+        key: &InstanceKey,
+        direction: &str,
+        limit: usize,
+    ) -> Result<Vec<TransferRecord>> {
+        let limit = i64::try_from(limit.min(1000)).expect("transfer batch limit is bounded");
+        let connection = self.lock()?;
+        let mut statement = connection.prepare(
+            r#"
+            WITH recent_batches AS (
+                SELECT batch_id, MAX(created_at_ms) AS batch_created_at
+                FROM transfers
+                WHERE instance_id = ?1 AND direction = ?2
+                GROUP BY batch_id
+                ORDER BY batch_created_at DESC, batch_id DESC
+                LIMIT ?3
+            )
+            SELECT transfers.id, transfers.batch_id, transfers.instance_id,
+                   transfers.direction, transfers.peer_alias, transfers.file_name,
+                   transfers.size, transfers.status, transfers.created_at_ms,
+                   transfers.error, transfers.content_type, transfers.is_clipboard
+            FROM transfers
+            INNER JOIN recent_batches USING (batch_id)
+            WHERE transfers.instance_id = ?1 AND transfers.direction = ?2
+            ORDER BY recent_batches.batch_created_at DESC, transfers.id ASC
+            "#,
+        )?;
+        let rows =
+            statement.query_map(params![key.instance_id(), direction, limit], transfer_row)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     pub fn list_transfers(&self, key: &InstanceKey, limit: usize) -> Result<Vec<TransferRecord>> {
@@ -227,35 +252,15 @@ impl Database {
         let connection = self.lock()?;
         let mut statement = connection.prepare(
             r#"
-            SELECT id, instance_id, direction, peer_alias, file_name, size,
-                   status, created_at_ms, error
+            SELECT id, batch_id, instance_id, direction, peer_alias, file_name, size,
+                   status, created_at_ms, error, content_type, is_clipboard
             FROM transfers
             WHERE instance_id = ?1
             ORDER BY created_at_ms DESC, id DESC
             LIMIT ?2
             "#,
         )?;
-        let rows = statement.query_map(params![key.instance_id(), limit], |row| {
-            let size = row.get::<_, i64>(5)?;
-            let size = u64::try_from(size).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    5,
-                    rusqlite::types::Type::Integer,
-                    Box::new(error),
-                )
-            })?;
-            Ok(TransferRecord {
-                id: row.get(0)?,
-                instance_id: row.get(1)?,
-                direction: row.get(2)?,
-                peer_alias: row.get(3)?,
-                file_name: row.get(4)?,
-                size,
-                status: row.get(6)?,
-                created_at_ms: row.get(7)?,
-                error: row.get(8)?,
-            })
-        })?;
+        let rows = statement.query_map(params![key.instance_id(), limit], transfer_row)?;
         rows.collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -265,6 +270,64 @@ impl Database {
             .lock()
             .map_err(|_| anyhow::anyhow!("SQLite connection lock is poisoned"))
     }
+}
+
+fn upsert_transfer(connection: &Connection, transfer: &TransferRecord) -> Result<()> {
+    let size = i64::try_from(transfer.size).context("transfer size exceeds SQLite range")?;
+    connection.execute(
+        r#"
+        INSERT INTO transfers (
+            id, batch_id, instance_id, direction, peer_alias, file_name, size,
+            status, created_at_ms, error, content_type, is_clipboard
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+        ON CONFLICT(id) DO UPDATE SET
+            batch_id = excluded.batch_id,
+            status = excluded.status,
+            error = excluded.error,
+            content_type = excluded.content_type,
+            is_clipboard = excluded.is_clipboard
+        "#,
+        params![
+            transfer.id,
+            transfer.batch_id,
+            transfer.instance_id,
+            transfer.direction,
+            transfer.peer_alias,
+            transfer.file_name,
+            size,
+            transfer.status,
+            transfer.created_at_ms,
+            transfer.error,
+            transfer.content_type,
+            transfer.is_clipboard,
+        ],
+    )?;
+    Ok(())
+}
+
+fn transfer_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<TransferRecord> {
+    let size = row.get::<_, i64>(6)?;
+    let size = u64::try_from(size).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            6,
+            rusqlite::types::Type::Integer,
+            Box::new(error),
+        )
+    })?;
+    Ok(TransferRecord {
+        id: row.get(0)?,
+        batch_id: row.get(1)?,
+        instance_id: row.get(2)?,
+        direction: row.get(3)?,
+        peer_alias: row.get(4)?,
+        file_name: row.get(5)?,
+        size,
+        status: row.get(7)?,
+        created_at_ms: row.get(8)?,
+        error: row.get(9)?,
+        content_type: row.get(10)?,
+        is_clipboard: row.get(11)?,
+    })
 }
 
 fn migrate(connection: &mut Connection) -> Result<()> {
@@ -305,6 +368,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
 
             CREATE TABLE transfers (
                 id TEXT PRIMARY KEY,
+                batch_id TEXT NOT NULL,
                 instance_id TEXT NOT NULL REFERENCES instances(instance_id) ON DELETE CASCADE,
                 direction TEXT NOT NULL CHECK (direction IN ('incoming', 'outgoing')),
                 peer_alias TEXT NOT NULL,
@@ -312,13 +376,68 @@ fn migrate(connection: &mut Connection) -> Result<()> {
                 size INTEGER NOT NULL CHECK (size >= 0),
                 status TEXT NOT NULL,
                 created_at_ms INTEGER NOT NULL,
-                error TEXT
+                error TEXT,
+                content_type TEXT,
+                is_clipboard INTEGER NOT NULL DEFAULT 0 CHECK (is_clipboard IN (0, 1))
             );
 
             CREATE INDEX idx_transfers_instance_created
                 ON transfers(instance_id, created_at_ms DESC);
+            CREATE INDEX idx_transfers_instance_direction_batch
+                ON transfers(instance_id, direction, created_at_ms DESC, batch_id);
 
-            PRAGMA user_version = 1;
+            PRAGMA user_version = 4;
+            "#,
+        )?;
+    } else if current == 1 {
+        transaction.execute_batch(
+            r#"
+            ALTER TABLE transfers ADD COLUMN content_type TEXT;
+            ALTER TABLE transfers ADD COLUMN is_clipboard INTEGER NOT NULL DEFAULT 0 CHECK (is_clipboard IN (0, 1));
+            ALTER TABLE transfers ADD COLUMN batch_id TEXT;
+            UPDATE transfers
+            SET batch_id = CASE
+                WHEN direction = 'outgoing' AND instr(id, ':') > 0
+                    THEN substr(id, 1, instr(id, ':') - 1)
+                ELSE id
+            END;
+            CREATE INDEX idx_transfers_instance_direction_batch
+                ON transfers(instance_id, direction, created_at_ms DESC, batch_id);
+            PRAGMA user_version = 4;
+            "#,
+        )?;
+    } else if current == 2 {
+        transaction.execute_batch(
+            r#"
+            ALTER TABLE transfers ADD COLUMN is_clipboard INTEGER NOT NULL DEFAULT 0 CHECK (is_clipboard IN (0, 1));
+            UPDATE transfers SET is_clipboard = 1 WHERE preview IS NOT NULL;
+            UPDATE transfers SET preview = NULL WHERE preview IS NOT NULL;
+            ALTER TABLE transfers DROP COLUMN preview;
+            ALTER TABLE transfers ADD COLUMN batch_id TEXT;
+            UPDATE transfers
+            SET batch_id = CASE
+                WHEN direction = 'outgoing' AND instr(id, ':') > 0
+                    THEN substr(id, 1, instr(id, ':') - 1)
+                ELSE id
+            END;
+            CREATE INDEX idx_transfers_instance_direction_batch
+                ON transfers(instance_id, direction, created_at_ms DESC, batch_id);
+            PRAGMA user_version = 4;
+            "#,
+        )?;
+    } else if current == 3 {
+        transaction.execute_batch(
+            r#"
+            ALTER TABLE transfers ADD COLUMN batch_id TEXT;
+            UPDATE transfers
+            SET batch_id = CASE
+                WHEN direction = 'outgoing' AND instr(id, ':') > 0
+                    THEN substr(id, 1, instr(id, ':') - 1)
+                ELSE id
+            END;
+            CREATE INDEX idx_transfers_instance_direction_batch
+                ON transfers(instance_id, direction, created_at_ms DESC, batch_id);
+            PRAGMA user_version = 4;
             "#,
         )?;
     }
@@ -455,6 +574,156 @@ mod tests {
             .unwrap();
         assert_eq!(global, vec!["enp2s0"]);
         assert_eq!(instance, vec!["lo"]);
+    }
+
+    #[test]
+    fn transfer_history_preserves_content_type() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("localsendy.sqlite3")).unwrap();
+        let key = InstanceKey::single();
+        database
+            .ensure_instance(defaults(&key, "One", 53317))
+            .unwrap();
+        database
+            .record_transfer(&TransferRecord {
+                id: "transfer:file".to_owned(),
+                batch_id: "transfer".to_owned(),
+                instance_id: key.instance_id(),
+                direction: "outgoing".to_owned(),
+                peer_alias: "Phone".to_owned(),
+                file_name: "message.txt".to_owned(),
+                size: 5,
+                status: "completed".to_owned(),
+                created_at_ms: 42,
+                error: None,
+                content_type: Some("text/plain".to_owned()),
+                is_clipboard: true,
+            })
+            .unwrap();
+
+        let transfers = database.list_transfers(&key, 10).unwrap();
+        assert_eq!(transfers[0].content_type.as_deref(), Some("text/plain"));
+        assert!(transfers[0].is_clipboard);
+    }
+
+    #[test]
+    fn transfer_batches_are_atomic_and_loaded_whole() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = Database::open(&directory.path().join("localsendy.sqlite3")).unwrap();
+        let key = InstanceKey::single();
+        database
+            .ensure_instance(defaults(&key, "One", 53317))
+            .unwrap();
+        let record = |id: &str, size: u64| TransferRecord {
+            id: id.to_owned(),
+            batch_id: "batch".to_owned(),
+            instance_id: key.instance_id(),
+            direction: "outgoing".to_owned(),
+            peer_alias: "Phone".to_owned(),
+            file_name: format!("{id}.bin"),
+            size,
+            status: "completed".to_owned(),
+            created_at_ms: 42,
+            error: None,
+            content_type: Some("application/octet-stream".to_owned()),
+            is_clipboard: false,
+        };
+
+        assert!(
+            database
+                .record_transfers(&[record("first", 1), record("invalid", u64::MAX)])
+                .is_err()
+        );
+        assert!(
+            database
+                .list_transfer_batches(&key, "outgoing", 1)
+                .unwrap()
+                .is_empty()
+        );
+
+        database
+            .record_transfers(&[record("first", 1), record("second", 2)])
+            .unwrap();
+        let restored = database.list_transfer_batches(&key, "outgoing", 1).unwrap();
+        assert_eq!(restored.len(), 2);
+        assert!(restored.iter().all(|record| record.batch_id == "batch"));
+    }
+
+    #[test]
+    fn migrates_schema_v2_clipboard_history_without_payloads() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("localsendy.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                r#"
+                CREATE TABLE transfers (
+                    id TEXT PRIMARY KEY,
+                    instance_id TEXT NOT NULL,
+                    direction TEXT NOT NULL,
+                    peer_alias TEXT NOT NULL,
+                    file_name TEXT NOT NULL,
+                    size INTEGER NOT NULL,
+                    status TEXT NOT NULL,
+                    created_at_ms INTEGER NOT NULL,
+                    error TEXT,
+                    content_type TEXT,
+                    preview TEXT
+                );
+                INSERT INTO transfers (
+                    id, instance_id, direction, peer_alias, file_name, size,
+                    status, created_at_ms, error, content_type, preview
+                ) VALUES ('legacy:clip', 'single:single', 'outgoing', 'Phone', 'message.txt', 5,
+                          'completed', 42, NULL, 'text/plain', 'secret clipboard text');
+                PRAGMA user_version = 2;
+                "#,
+            )
+            .unwrap();
+        drop(connection);
+
+        drop(Database::open(&path).unwrap());
+        let connection = Connection::open(&path).unwrap();
+        let clipboard_column: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('transfers') WHERE name = 'is_clipboard'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let legacy_preview_column: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('transfers') WHERE name = 'preview'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let legacy_clipboard: i64 = connection
+            .query_row(
+                "SELECT is_clipboard FROM transfers WHERE id = 'legacy:clip'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let version: i64 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+
+        assert_eq!(clipboard_column, 1);
+        assert_eq!(legacy_preview_column, 0);
+        assert_eq!(legacy_clipboard, 1);
+        assert_eq!(version, SCHEMA_VERSION);
+        drop(connection);
+        let secret = b"secret clipboard text";
+        assert!(
+            !std::fs::read(&path)
+                .unwrap()
+                .windows(secret.len())
+                .any(|window| window == secret)
+        );
+        let wal_path = path.with_extension("sqlite3-wal");
+        if let Ok(wal) = std::fs::read(wal_path) {
+            assert!(!wal.windows(secret.len()).any(|window| window == secret));
+        }
     }
 
     #[test]

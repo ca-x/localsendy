@@ -25,9 +25,9 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> Result<Self> {
-        let web_bind = env_var("LOCALSENDY_BIND", "0.0.0.0:8080")
+        let web_bind = env_var("LOCALSENDY_BIND", "0.0.0.0:52222")
             .parse()
-            .context("LOCALSENDY_BIND must be a socket address such as 0.0.0.0:8080")?;
+            .context("LOCALSENDY_BIND must be a socket address such as 0.0.0.0:52222")?;
         let localsend_port = parse_env("LOCALSENDY_PORT", 53317_u16)?;
         let data_dir = PathBuf::from(env_var("LOCALSENDY_DATA_DIR", "/data"));
         fs::create_dir_all(&data_dir)

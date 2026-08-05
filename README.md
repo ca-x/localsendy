@@ -9,12 +9,12 @@ Localsendy is a Docker-first LocalSend node with a responsive web interface. The
 
 ## What works
 
-- LocalSend v2 HTTPS receiver powered by [`localsend-rs`](https://github.com/CrossCopy/localsend-rs)
+- LocalSend v2 HTTPS receiver and sender built on LocalSend's official Rust core
 - Automatic multi-interface IPv4/IPv6 UDP multicast discovery with optional advanced filtering
 - Automatic Ethernet-over-Wi-Fi preference when both adapters reach the same network, with runtime failover
-- Multi-file sending to discovered LocalSend devices
-- Explicit accept/decline flow or opt-in automatic acceptance
-- Receive history and outgoing transfer status
+- Multi-file and clipboard-text sending to one or many LocalSend devices
+- Explicit accept/decline flow or startup automatic acceptance configured by environment
+- Live send/receive byte progress plus persistent outgoing and receive history
 - Responsive Send / Receive / Settings navigation based on the official LocalSend information architecture
 - English, Simplified Chinese, and Traditional Chinese UI foundations
 - Persistent official-style localized random device names with configurable prefix, type, and model
@@ -29,7 +29,7 @@ Linux host networking is recommended because LocalSend discovery uses multicast 
 docker compose up -d
 ```
 
-Open `http://<server-ip>:8080`. Received files are written to `./data/downloads`.
+Open `http://<server-ip>:52222`. Received files are written to `./data/downloads`.
 
 The first start creates a persistent official-style random identity in `/data/device-identity.json`. To use a fixed name instead:
 
@@ -51,7 +51,7 @@ Network preferences and interface labels are saved to `/data/network-settings.js
 
 | Variable | Default | Purpose |
 | --- | --- | --- |
-| `LOCALSENDY_BIND` | `0.0.0.0:8080` | Web UI and control API bind address |
+| `LOCALSENDY_BIND` | `0.0.0.0:52222` | Web UI and control API bind address |
 | `LOCALSENDY_ALIAS` | unset | Fixed device name; overrides generated names and prefixes |
 | `LOCALSENDY_ALIAS_PREFIX` | unset | Prefix added to the generated localized name |
 | `LOCALSENDY_ALIAS_LOCALE` | `auto` | Generated-name locale: `auto`, `en`, `zh-CN`, or `zh-TW`; `auto` follows `LC_ALL`/`LANG` |
@@ -61,7 +61,7 @@ Network preferences and interface labels are saved to `/data/network-settings.js
 | `LOCALSENDY_DATA_DIR` | `/data` | Persistent storage root |
 | `LOCALSENDY_DOWNLOAD_DIR` | `/data/downloads` | Directory for received files; overrides the data-root default |
 | `LOCALSENDY_TEMP_DIR` | `/data/tmp` | Temporary workspace for runtime data |
-| `LOCALSENDY_AUTO_ACCEPT` | `false` | Accept inbound transfers without browser approval |
+| `LOCALSENDY_AUTO_ACCEPT` | `false` | Accept incoming transfers automatically; evaluated at service startup |
 | `LOCALSENDY_DISCOVERY_INTERVAL_SECONDS` | `30` | Presence announcement interval, minimum 5 seconds |
 | `LOCALSENDY_NETWORK_INTERFACES` | `all` | Initial fallback: `all`, `*`, or a comma-separated interface list; persisted UI settings take precedence |
 | `LOCALSENDY_MAX_UPLOAD_BYTES` | `10737418240` | Maximum total size of one browser send request |
@@ -71,7 +71,7 @@ Alias, device type, device model, and port are startup identity values. Change t
 
 ## Current protocol boundaries
 
-Localsendy exposes only settings that the current service can enforce. Automatic acceptance and the save directory are supported. PIN validation, favorite-device trust rules, share-by-link, and configurable multicast groups are not implemented by the current `localsend-rs` integration and are intentionally not shown as working controls.
+Localsendy exposes only settings that the current service can enforce. Automatic acceptance and the save directory are supported. PIN validation, favorite-device trust rules, share-by-link, and configurable multicast groups are not implemented by the current service and are intentionally not shown as working controls.
 
 ## Local development
 
@@ -89,7 +89,7 @@ npm --prefix web run build
 cargo run
 ```
 
-Vite proxies `/api` to `127.0.0.1:8080` during development.
+Vite proxies `/api` to `127.0.0.1:52222` during development.
 
 ## Verification
 
@@ -98,8 +98,8 @@ npm --prefix web run typecheck
 npm --prefix web run test:ci
 npm --prefix web run build
 cargo fmt --all --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-targets --all-features
 docker build -t localsendy:dev .
 ```
 
@@ -109,7 +109,7 @@ docker build -t localsendy:dev .
 Browser (React/Vite)
         │ /api/v1
         ▼
-Localsendy (Axum, :8080)
+Localsendy (Axum, :52222)
         ├── multicast discovery (UDP :53317)
         ├── LocalSend HTTPS receiver (TCP :53317)
         ├── LocalSend client for outgoing transfers
@@ -121,16 +121,16 @@ See [docs/architecture.md](docs/architecture.md) and the persisted [design syste
 ## Roadmap
 
 - Saved manual targets for networks where multicast is unavailable
-- Text messages and share-by-link mode
-- Transfer progress events and cancellation
-- Persistent history with retention controls
+- Share-by-link mode
+- Transfer cancellation
+- History retention controls
 - Additional official LocalSend locale coverage
 
 ## Attribution
 
 The product flow and interoperability target are informed by the official [LocalSend](https://github.com/localsend/localsend) project. Localsendy is an independent project and is not affiliated with or endorsed by LocalSend.
 
-The protocol implementation is provided by the MIT-licensed [`localsend-rs`](https://github.com/CrossCopy/localsend-rs) crate.
+The protocol implementation is vendored from LocalSend's MIT-licensed official Rust core. Upstream revision details are recorded in [`third_party/localsend-core/UPSTREAM.md`](third_party/localsend-core/UPSTREAM.md).
 
 ## License
 

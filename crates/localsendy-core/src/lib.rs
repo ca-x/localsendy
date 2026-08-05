@@ -9,7 +9,10 @@ mod receiver;
 mod types;
 
 pub use identity::{DeviceIdentity, IdentityMaterial};
-pub use receiver::{PendingTransfer, ReceiverHandle, ReceiverState, start_receiver};
+pub use receiver::{
+    IncomingTransfer, IncomingTransferStatus, PendingTransfer, ReceiverHandle, ReceiverState,
+    start_receiver,
+};
 pub use types::{
     AnnouncementMessage, DeviceInfo, DeviceType, FileId, FileMetadata, PROTOCOL_VERSION, Protocol,
     ReceivedFile,

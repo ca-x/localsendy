@@ -1,20 +1,25 @@
 use std::{
-    collections::HashMap,
+    cmp::Reverse,
+    collections::{HashMap, HashSet},
     net::{IpAddr, SocketAddr},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path as AxumPath, Query, State, multipart::Field},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use bytes::Bytes;
 use chrono::Utc;
-use futures_util::StreamExt;
+use futures_util::{StreamExt, stream};
 use localsend::{
     http::{client::v2::LsHttpClientV2, dto_v2::PrepareUploadRequestDtoV2},
     model::transfer::{FileContent, FileDto},
@@ -26,6 +31,7 @@ use serde::{Deserialize, Serialize};
 use tokio::{fs::File, io::AsyncWriteExt};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 use uuid::Uuid;
 
 use crate::network::{
@@ -34,6 +40,19 @@ use crate::network::{
     route_interface_for_ip, save_preferences,
 };
 use crate::state::{AppState, DiscoveredDevice, OutgoingTransfer, SeenDevice, TransferStatus};
+
+const MAX_SEND_TARGETS: usize = 32;
+const MAX_SEND_FILES: usize = 100;
+pub(crate) const MAX_CONCURRENT_SENDS: usize = 4;
+const MAX_TEXT_BYTES: u64 = 1024 * 1024;
+const MAX_TEXT_REQUEST_BYTES: usize = MAX_TEXT_BYTES as usize * 6 + 64 * 1024;
+const MAX_TARGET_FIELD_BYTES: usize = 256 * 1024;
+const MAX_PIN_FIELD_BYTES: usize = 128;
+const MAX_IN_MEMORY_TRANSFERS: usize = 100;
+const REGISTER_TIMEOUT: Duration = Duration::from_secs(10);
+const PREPARE_TIMEOUT: Duration = Duration::from_secs(120);
+const CANCEL_TIMEOUT: Duration = Duration::from_secs(10);
+const TEMP_UPLOAD_PREFIX: &str = "send-";
 
 pub fn router(state: AppState) -> Router {
     Router::new()
@@ -52,13 +71,22 @@ pub fn router(state: AppState) -> Router {
         .route("/pending/{decision}", post(decide_pending))
         .route("/history", get(history))
         .route("/transfers", get(transfers))
-        .route("/send", post(send_files))
-        .layer(DefaultBodyLimit::disable())
+        .route("/transfers/incoming", get(incoming_transfers))
+        .route("/send", post(send_files).layer(DefaultBodyLimit::disable()))
+        .route(
+            "/send/text",
+            post(send_text).layer(DefaultBodyLimit::max(MAX_TEXT_REQUEST_BYTES)),
+        )
+        .fallback(api_not_found)
         .with_state(state)
 }
 
 async fn health() -> StatusCode {
     StatusCode::NO_CONTENT
+}
+
+async fn api_not_found() -> ApiError {
+    ApiError::not_found("API endpoint not found")
 }
 
 #[derive(Serialize)]
@@ -221,11 +249,19 @@ async fn devices(State(state): State<AppState>) -> Json<Vec<DiscoveredDevice>> {
 }
 
 async fn scan(State(state): State<AppState>) -> Result<StatusCode, ApiError> {
-    state
-        .scan_tx
-        .try_send(DiscoveryCommand::Announce)
-        .map_err(|_| ApiError::conflict("A discovery scan is already queued"))?;
+    queue_discovery_scan(&state.scan_tx)?;
     Ok(StatusCode::ACCEPTED)
+}
+
+fn queue_discovery_scan(
+    scan_tx: &tokio::sync::mpsc::Sender<DiscoveryCommand>,
+) -> Result<(), ApiError> {
+    match scan_tx.try_send(DiscoveryCommand::Announce) {
+        Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => Ok(()),
+        Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+            Err(ApiError::internal("Discovery service is not running"))
+        }
+    }
 }
 
 async fn networks(State(state): State<AppState>) -> Result<Json<NetworkSettings>, ApiError> {
@@ -474,7 +510,16 @@ async fn history(State(state): State<AppState>) -> Json<Vec<ReceivedFile>> {
 }
 
 async fn transfers(State(state): State<AppState>) -> Json<Vec<OutgoingTransfer>> {
-    let mut transfers = state.outgoing_transfers.read().await.clone();
+    let mut current = state.outgoing_transfers.read().await.clone();
+    current.sort_by_key(|transfer| Reverse(transfer.created_at));
+    current.truncate(100);
+    Json(current)
+}
+
+async fn incoming_transfers(
+    State(state): State<AppState>,
+) -> Json<Vec<localsendy_core::IncomingTransfer>> {
+    let mut transfers = state.incoming_transfers.read().await.clone();
     transfers.reverse();
     Json(transfers)
 }
@@ -483,8 +528,114 @@ async fn transfers(State(state): State<AppState>) -> Json<Vec<OutgoingTransfer>>
 #[serde(rename_all = "camelCase")]
 struct SendResponse {
     transfer_id: Uuid,
+    transfers: Vec<SendTargetResponse>,
     files_sent: usize,
     total_bytes: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct SendTargetResponse {
+    transfer_id: Uuid,
+    target_alias: String,
+    files_sent: usize,
+    total_bytes: u64,
+    success: bool,
+    error: Option<String>,
+}
+
+struct SendOutcome {
+    accepted_ids: HashSet<String>,
+    total_bytes: u64,
+}
+
+struct SendFailure {
+    error: ApiError,
+    completed_ids: HashSet<String>,
+    completed_bytes: u64,
+}
+
+impl From<ApiError> for SendFailure {
+    fn from(error: ApiError) -> Self {
+        Self {
+            error,
+            completed_ids: HashSet::new(),
+            completed_bytes: 0,
+        }
+    }
+}
+
+struct RemoteSessionGuard {
+    signal: Option<tokio::sync::oneshot::Sender<bool>>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl RemoteSessionGuard {
+    fn arm(
+        state: &AppState,
+        protocol: localsend::model::discovery::ProtocolType,
+        host: &str,
+        port: u16,
+        session_id: &str,
+        expected_fingerprint: Option<String>,
+    ) -> Self {
+        let private_key = state.identity.material.private_key_pem.clone();
+        let certificate = state.identity.material.certificate_pem.clone();
+        let host = host.to_owned();
+        let session_id = session_id.to_owned();
+        let (signal, receiver) = tokio::sync::oneshot::channel::<bool>();
+        let task = tokio::spawn(async move {
+            if matches!(receiver.await, Ok(true)) {
+                return;
+            }
+            let client = match LsHttpClientV2::try_new(
+                &private_key,
+                &certificate,
+                expected_fingerprint,
+                None,
+            ) {
+                Ok(client) => client,
+                Err(error) => {
+                    warn!(%error, %session_id, "failed to create LocalSend cancellation client");
+                    return;
+                }
+            };
+            match tokio::time::timeout(
+                CANCEL_TIMEOUT,
+                client.cancel(protocol, &host, port, &session_id),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    warn!(%error, %session_id, "failed to cancel remote LocalSend session")
+                }
+                Err(_) => warn!(%session_id, "timed out cancelling remote LocalSend session"),
+            }
+        });
+        Self {
+            signal: Some(signal),
+            task: Some(task),
+        }
+    }
+
+    async fn complete(mut self) {
+        if let Some(signal) = self.signal.take() {
+            let _ = signal.send(true);
+        }
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+
+    async fn cancel(mut self) {
+        if let Some(signal) = self.signal.take() {
+            let _ = signal.send(false);
+        }
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
 }
 
 struct TempUpload {
@@ -492,14 +643,63 @@ struct TempUpload {
     original_name: String,
     content_type: String,
     size: u64,
-    path: std::path::PathBuf,
+    content: TempUploadContent,
+    preview: Option<String>,
+    is_clipboard: bool,
+}
+
+enum TempUploadContent {
+    Path(PathBuf),
+    Bytes(Bytes),
+}
+
+struct TempPathGuard(Option<PathBuf>);
+
+impl TempPathGuard {
+    fn new(path: PathBuf) -> Self {
+        Self(Some(path))
+    }
+
+    fn disarm(mut self) -> PathBuf {
+        self.0.take().expect("temporary path guard should be armed")
+    }
+}
+
+impl Drop for TempPathGuard {
+    fn drop(&mut self) {
+        if let Some(path) = self.0.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+impl TempUpload {
+    fn file_content(&self) -> FileContent {
+        match &self.content {
+            TempUploadContent::Path(path) => FileContent::Path(path.clone()),
+            TempUploadContent::Bytes(bytes) => {
+                let (tx, rx) = tokio::sync::mpsc::channel(1);
+                tx.try_send(bytes.clone())
+                    .expect("clipboard payload channel should have capacity");
+                FileContent::Stream(rx)
+            }
+        }
+    }
+}
+
+impl Drop for TempUpload {
+    fn drop(&mut self) {
+        if let TempUploadContent::Path(path) = &self.content {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 async fn send_files(
     State(state): State<AppState>,
     mut multipart: Multipart,
 ) -> Result<Json<SendResponse>, ApiError> {
-    let mut target = None;
+    let mut targets = Vec::new();
     let mut pin = None;
     let mut uploads = Vec::new();
     let mut total_bytes = 0_u64;
@@ -511,39 +711,76 @@ async fn send_files(
     {
         let field_name = field.name().unwrap_or_default().to_owned();
         match field_name.as_str() {
-            "target" => {
-                let value = match field.text().await {
+            "target" | "targets" => {
+                if !uploads.is_empty() {
+                    cleanup_uploads(&uploads).await;
+                    return Err(ApiError::bad_request(
+                        "Target devices must be provided before files",
+                    ));
+                }
+                let value = match read_limited_text_field(&mut field, MAX_TARGET_FIELD_BYTES).await
+                {
                     Ok(value) => value,
                     Err(error) => {
                         cleanup_uploads(&uploads).await;
-                        return Err(ApiError::bad_request(error.to_string()));
+                        return Err(error);
                     }
                 };
-                target = match serde_json::from_str::<DeviceInfo>(&value) {
-                    Ok(device) => Some(device),
+                let parsed = if field_name == "targets" {
+                    serde_json::from_str::<Vec<DeviceInfo>>(&value)
+                } else {
+                    serde_json::from_str::<DeviceInfo>(&value).map(|target| vec![target])
+                };
+                match parsed {
+                    Ok(mut parsed) => {
+                        if let Err(error) = validate_target_count(&parsed) {
+                            cleanup_uploads(&uploads).await;
+                            return Err(error);
+                        }
+                        deduplicate_targets(&mut parsed);
+                        targets.extend(parsed);
+                        deduplicate_targets(&mut targets);
+                        if let Err(error) = validate_target_count(&targets) {
+                            cleanup_uploads(&uploads).await;
+                            return Err(error);
+                        }
+                    }
                     Err(error) => {
                         cleanup_uploads(&uploads).await;
                         return Err(ApiError::bad_request(format!(
-                            "Invalid target device: {error}"
+                            "Invalid target devices: {error}"
                         )));
                     }
-                };
+                }
             }
             "pin" => {
-                let value = field
-                    .text()
-                    .await
-                    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+                let value = match read_limited_text_field(&mut field, MAX_PIN_FIELD_BYTES).await {
+                    Ok(value) => value,
+                    Err(error) => {
+                        cleanup_uploads(&uploads).await;
+                        return Err(error);
+                    }
+                };
                 if !value.trim().is_empty() {
                     pin = Some(value);
                 }
             }
             "files" => {
-                if target.is_none() {
+                if uploads.len() >= MAX_SEND_FILES {
+                    cleanup_uploads(&uploads).await;
+                    return Err(ApiError::bad_request(format!(
+                        "Select no more than {MAX_SEND_FILES} files"
+                    )));
+                }
+                if targets.is_empty() {
                     cleanup_uploads(&uploads).await;
                     return Err(ApiError::bad_request(
                         "The target device must be provided before files",
                     ));
+                }
+                if let Err(error) = validate_known_targets(&state, &targets) {
+                    cleanup_uploads(&uploads).await;
+                    return Err(error);
                 }
                 let original_name = safe_file_name(field.file_name().unwrap_or("file"));
                 let content_type = field
@@ -551,7 +788,11 @@ async fn send_files(
                     .unwrap_or("application/octet-stream")
                     .to_owned();
                 let id = FileId::new();
-                let temp_path = state.config.temp_dir().join(id.as_str());
+                let temp_path = state
+                    .config
+                    .temp_dir()
+                    .join(format!("{TEMP_UPLOAD_PREFIX}{}", id.as_str()));
+                let temp_guard = TempPathGuard::new(temp_path.clone());
                 let mut output = match File::create(&temp_path).await {
                     Ok(output) => output,
                     Err(error) => {
@@ -601,7 +842,9 @@ async fn send_files(
                     original_name,
                     content_type,
                     size,
-                    path: temp_path,
+                    content: TempUploadContent::Path(temp_guard.disarm()),
+                    preview: None,
+                    is_clipboard: false,
                 });
             }
             _ => {}
@@ -612,54 +855,272 @@ async fn send_files(
         return Err(ApiError::bad_request("Select at least one file"));
     }
 
-    let target = target.ok_or_else(|| ApiError::bad_request("Missing target device"))?;
+    if targets.is_empty() {
+        return Err(ApiError::bad_request("Select at least one target device"));
+    }
+    deduplicate_targets(&mut targets);
+    validate_target_count(&targets)?;
+    send_uploads(&state, targets, pin, uploads, total_bytes).await
+}
+
+async fn read_limited_text_field(
+    field: &mut Field<'_>,
+    max_bytes: usize,
+) -> Result<String, ApiError> {
+    let mut value = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|error| ApiError::bad_request(error.to_string()))?
+    {
+        if value.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(ApiError::payload_too_large(
+                "Multipart text field exceeds its configured limit",
+            ));
+        }
+        value.extend_from_slice(&chunk);
+    }
+    String::from_utf8(value).map_err(ApiError::bad_request)
+}
+
+#[derive(Deserialize)]
+struct SendTextRequest {
+    #[serde(default)]
+    targets: Vec<DeviceInfo>,
+    target: Option<DeviceInfo>,
+    text: String,
+    pin: Option<String>,
+}
+
+async fn send_text(
+    State(state): State<AppState>,
+    Json(request): Json<SendTextRequest>,
+) -> Result<Json<SendResponse>, ApiError> {
+    let mut targets = request.targets;
+    if let Some(target) = request.target {
+        targets.push(target);
+    }
+    validate_target_count(&targets)?;
+    deduplicate_targets(&mut targets);
+    if targets.is_empty() {
+        return Err(ApiError::bad_request("Select at least one target device"));
+    }
+    validate_target_count(&targets)?;
+    validate_known_targets(&state, &targets)?;
+    let upload = build_text_upload(
+        &request.text,
+        state.config.max_upload_bytes.min(MAX_TEXT_BYTES),
+    )?;
+    let total_bytes = upload.size;
+    send_uploads(
+        &state,
+        targets,
+        request.pin.filter(|pin| !pin.trim().is_empty()),
+        vec![upload],
+        total_bytes,
+    )
+    .await
+}
+
+fn build_text_upload(text: &str, max_upload_bytes: u64) -> Result<TempUpload, ApiError> {
+    if text.trim().is_empty() {
+        return Err(ApiError::bad_request("Enter text to send"));
+    }
+    let size = u64::try_from(text.len()).map_err(ApiError::payload_too_large)?;
+    if size > max_upload_bytes {
+        return Err(ApiError::payload_too_large(format!(
+            "Text exceeds the configured {max_upload_bytes} byte limit"
+        )));
+    }
+    let id = FileId::new();
+    Ok(TempUpload {
+        original_name: format!("{}.txt", id.as_str()),
+        content_type: "text/plain".to_owned(),
+        size,
+        content: TempUploadContent::Bytes(Bytes::copy_from_slice(text.as_bytes())),
+        preview: Some(text.to_owned()),
+        is_clipboard: true,
+        id,
+    })
+}
+
+async fn send_uploads(
+    state: &AppState,
+    targets: Vec<DeviceInfo>,
+    pin: Option<String>,
+    uploads: Vec<TempUpload>,
+    total_bytes: u64,
+) -> Result<Json<SendResponse>, ApiError> {
+    let results = stream::iter(
+        targets
+            .into_iter()
+            .map(|target| send_to_target(state, target, pin.as_deref(), &uploads, total_bytes)),
+    )
+    .buffer_unordered(MAX_CONCURRENT_SENDS)
+    .collect::<Vec<_>>()
+    .await;
+    cleanup_uploads(&uploads).await;
+    let transfer_id = results
+        .first()
+        .expect("target validation requires at least one device")
+        .transfer_id;
+    if results.iter().all(|result| result.files_sent == 0) {
+        return Err(ApiError::bad_gateway(
+            results
+                .iter()
+                .filter_map(|result| result.error.as_deref())
+                .collect::<Vec<_>>()
+                .join("; "),
+        ));
+    }
+    let files_sent = results.iter().map(|result| result.files_sent).sum();
+    let batch_total_bytes = results.iter().map(|result| result.total_bytes).sum();
+    Ok(Json(SendResponse {
+        transfer_id,
+        transfers: results,
+        files_sent,
+        total_bytes: batch_total_bytes,
+    }))
+}
+
+async fn send_to_target(
+    state: &AppState,
+    target: DeviceInfo,
+    pin: Option<&str>,
+    uploads: &[TempUpload],
+    total_bytes: u64,
+) -> SendTargetResponse {
+    let _permit = state
+        .send_semaphore
+        .acquire()
+        .await
+        .expect("send semaphore should remain open");
     let transfer_id = Uuid::new_v4();
     let file_names = uploads
         .iter()
         .map(|upload| upload.original_name.clone())
         .collect::<Vec<_>>();
+    let transferred_bytes = Arc::new(AtomicU64::new(0));
     let transfer = OutgoingTransfer {
         id: transfer_id,
         target_alias: target.alias.clone(),
         file_names,
         total_bytes,
+        transferred_bytes: transferred_bytes.clone(),
         status: TransferStatus::Preparing,
         created_at: Utc::now(),
         error: None,
+        content_type: uploads.first().map(|upload| upload.content_type.clone()),
+        is_clipboard: uploads.first().is_some_and(|upload| upload.is_clipboard),
     };
-    state.outgoing_transfers.write().await.push(transfer);
+    {
+        let mut transfers = state.outgoing_transfers.write().await;
+        if transfers.len() >= MAX_IN_MEMORY_TRANSFERS
+            && let Some(index) = transfers.iter().position(|transfer| {
+                matches!(
+                    transfer.status,
+                    TransferStatus::Completed | TransferStatus::Failed
+                )
+            })
+        {
+            transfers.remove(index);
+        }
+        transfers.push(transfer);
+    }
 
-    let result = perform_send(&state, &target, pin.as_deref(), &uploads).await;
-    cleanup_uploads(&uploads).await;
-
-    let mut records = state.outgoing_transfers.write().await;
-    let record = records
-        .iter_mut()
-        .find(|record| record.id == transfer_id)
-        .expect("newly inserted transfer record should exist");
+    let result = perform_send(
+        state,
+        transfer_id,
+        &target,
+        pin,
+        uploads,
+        total_bytes,
+        transferred_bytes.clone(),
+    )
+    .await;
 
     match result {
-        Ok(files_sent) => {
-            record.status = TransferStatus::Completed;
-            persist_outgoing_transfers(&state, transfer_id, &target, &uploads, "completed", None)?;
-            Ok(Json(SendResponse {
-                transfer_id,
-                files_sent,
-                total_bytes,
-            }))
-        }
-        Err(error) => {
-            record.status = TransferStatus::Failed;
-            record.error = Some(error.message.clone());
-            persist_outgoing_transfers(
-                &state,
+        Ok(outcome) => {
+            let files_sent = outcome.accepted_ids.len();
+            let all_accepted = files_sent == uploads.len();
+            let partial_error = (!all_accepted)
+                .then(|| format!("Receiver accepted {files_sent} of {} files", uploads.len()));
+            if let Some(record) = state
+                .outgoing_transfers
+                .write()
+                .await
+                .iter_mut()
+                .find(|record| record.id == transfer_id)
+            {
+                record.status = if all_accepted {
+                    TransferStatus::Completed
+                } else {
+                    TransferStatus::Failed
+                };
+                record.total_bytes = outcome.total_bytes;
+                record.error = partial_error.clone();
+            }
+            transferred_bytes.store(outcome.total_bytes, Ordering::Relaxed);
+            let persistence_error = persist_outgoing_transfers(
+                state,
                 transfer_id,
                 &target,
-                &uploads,
-                "failed",
+                uploads,
+                Some(&outcome.accepted_ids),
+                partial_error.as_deref(),
+            )
+            .err()
+            .map(|error| error.message);
+            let error = match (partial_error, persistence_error) {
+                (Some(partial), Some(persistence)) => Some(format!("{partial}; {persistence}")),
+                (Some(partial), None) => Some(partial),
+                (None, Some(persistence)) => Some(persistence),
+                (None, None) => None,
+            };
+            SendTargetResponse {
+                transfer_id,
+                target_alias: target.alias,
+                files_sent,
+                total_bytes: outcome.total_bytes,
+                success: all_accepted,
+                error,
+            }
+        }
+        Err(failure) => {
+            let error = failure.error;
+            if let Some(record) = state
+                .outgoing_transfers
+                .write()
+                .await
+                .iter_mut()
+                .find(|record| record.id == transfer_id)
+            {
+                record.status = TransferStatus::Failed;
+                record.error = Some(error.message.clone());
+            }
+            transferred_bytes.store(failure.completed_bytes, Ordering::Relaxed);
+            let persistence_result = persist_outgoing_transfers(
+                state,
+                transfer_id,
+                &target,
+                uploads,
+                Some(&failure.completed_ids),
                 Some(&error.message),
-            )?;
-            Err(error)
+            );
+            let message = match persistence_result {
+                Ok(()) => error.message,
+                Err(persistence_error) => {
+                    format!("{}; {}", error.message, persistence_error.message)
+                }
+            };
+            SendTargetResponse {
+                transfer_id,
+                target_alias: target.alias,
+                files_sent: failure.completed_ids.len(),
+                total_bytes: failure.completed_bytes,
+                success: false,
+                error: Some(message),
+            }
         }
     }
 }
@@ -669,35 +1130,68 @@ fn persist_outgoing_transfers(
     transfer_id: Uuid,
     target: &DeviceInfo,
     uploads: &[TempUpload],
-    status: &str,
+    accepted_ids: Option<&HashSet<String>>,
     error: Option<&str>,
 ) -> Result<(), ApiError> {
+    let records = outgoing_transfer_records(
+        state.instance_key.instance_id(),
+        transfer_id,
+        target,
+        uploads,
+        accepted_ids,
+        error,
+    );
+    state
+        .database
+        .record_transfers(&records)
+        .map_err(ApiError::internal)
+}
+
+fn outgoing_transfer_records(
+    instance_id: String,
+    transfer_id: Uuid,
+    target: &DeviceInfo,
+    uploads: &[TempUpload],
+    accepted_ids: Option<&HashSet<String>>,
+    error: Option<&str>,
+) -> Vec<TransferRecord> {
     let created_at_ms = Utc::now().timestamp_millis();
-    for upload in uploads {
-        state
-            .database
-            .record_transfer(&TransferRecord {
+    let batch_id = transfer_id.to_string();
+    uploads
+        .iter()
+        .map(|upload| {
+            let completed = accepted_ids.is_some_and(|ids| ids.contains(upload.id.as_str()));
+            TransferRecord {
                 id: format!("{transfer_id}:{}", upload.id),
-                instance_id: state.instance_key.instance_id(),
+                batch_id: batch_id.clone(),
+                instance_id: instance_id.clone(),
                 direction: "outgoing".to_owned(),
                 peer_alias: target.alias.clone(),
                 file_name: upload.original_name.clone(),
                 size: upload.size,
-                status: status.to_owned(),
+                status: if completed { "completed" } else { "failed" }.to_owned(),
                 created_at_ms,
-                error: error.map(ToOwned::to_owned),
-            })
-            .map_err(ApiError::internal)?;
-    }
-    Ok(())
+                error: (!completed).then(|| {
+                    error
+                        .unwrap_or("Receiver did not accept this file")
+                        .to_owned()
+                }),
+                content_type: Some(upload.content_type.clone()),
+                is_clipboard: upload.is_clipboard,
+            }
+        })
+        .collect()
 }
 
 async fn perform_send(
     state: &AppState,
+    transfer_id: Uuid,
     target: &DeviceInfo,
     pin: Option<&str>,
     uploads: &[TempUpload],
-) -> Result<usize, ApiError> {
+    total_bytes: u64,
+    transferred_bytes: Arc<AtomicU64>,
+) -> Result<SendOutcome, SendFailure> {
     let host = target
         .ip
         .as_deref()
@@ -708,38 +1202,34 @@ async fn perform_send(
     let client = LsHttpClientV2::try_new(
         &state.identity.material.private_key_pem,
         &state.identity.material.certificate_pem,
-        expected_fingerprint,
+        expected_fingerprint.clone(),
         None,
     )
     .map_err(|error| ApiError::internal(error.to_string()))?;
-    let registration = client
-        .register(
+    let registration = tokio::time::timeout(
+        REGISTER_TIMEOUT,
+        client.register(
             protocol,
             host,
             target.port,
             state.local_device.to_register(),
-        )
-        .await
-        .map_err(|error| ApiError::bad_gateway(error.to_string()))?;
+        ),
+    )
+    .await
+    .map_err(|_| ApiError::bad_gateway("Target registration timed out"))?
+    .map_err(|error| ApiError::bad_gateway(error.to_string()))?;
 
     let files = uploads
         .iter()
         .map(|upload| {
-            let metadata = FileDto {
-                id: upload.id.0.clone(),
-                file_name: upload.original_name.clone(),
-                size: upload.size,
-                file_type: upload.content_type.clone(),
-                sha256: None,
-                preview: None,
-                metadata: None,
-            };
+            let metadata = file_metadata(upload);
             (upload.id.0.clone(), metadata)
         })
         .collect::<HashMap<_, _>>();
 
-    let prepared = client
-        .prepare_upload(
+    let prepared = tokio::time::timeout(
+        PREPARE_TIMEOUT,
+        client.prepare_upload(
             protocol,
             host,
             target.port,
@@ -750,43 +1240,178 @@ async fn perform_send(
             },
             pin,
             CancellationToken::new(),
-        )
-        .await
-        .map_err(|error| ApiError::bad_gateway(error.to_string()))?;
+        ),
+    )
+    .await
+    .map_err(|_| ApiError::bad_gateway("Target did not answer the transfer request"))?
+    .map_err(|error| ApiError::bad_gateway(error.to_string()))?;
     let Some(prepared) = prepared.response else {
-        return Ok(0);
+        if uploads.iter().all(|upload| upload.is_clipboard) {
+            return Ok(SendOutcome {
+                accepted_ids: uploads
+                    .iter()
+                    .map(|upload| upload.id.as_str().to_owned())
+                    .collect(),
+                total_bytes,
+            });
+        }
+        return Err(ApiError::bad_gateway("Target accepted no files").into());
     };
+    let session_id = prepared.session_id;
+    let session_guard = RemoteSessionGuard::arm(
+        state,
+        protocol,
+        host,
+        target.port,
+        &session_id,
+        expected_fingerprint,
+    );
+    if let Some(transfer) = state
+        .outgoing_transfers
+        .write()
+        .await
+        .iter_mut()
+        .find(|transfer| transfer.id == transfer_id)
+    {
+        transfer.status = TransferStatus::Sending;
+    }
     let by_id = uploads
         .iter()
         .map(|upload| (upload.id.as_str(), upload))
         .collect::<HashMap<_, _>>();
 
-    for (file_id, token) in &prepared.files {
+    let accepted_ids = prepared.files.keys().cloned().collect::<HashSet<_>>();
+    let accepted_total_bytes = accepted_ids.iter().try_fold(0_u64, |total, file_id| {
         let upload = by_id
             .get(file_id.as_str())
             .ok_or_else(|| ApiError::internal("Receiver accepted an unknown file"))?;
-        client
-            .upload(
+        Ok::<_, ApiError>(total.saturating_add(upload.size))
+    });
+    let accepted_total_bytes = match accepted_total_bytes {
+        Ok(total) if !accepted_ids.is_empty() => total,
+        Ok(_) => {
+            session_guard.cancel().await;
+            return Err(ApiError::bad_gateway("Target accepted no files").into());
+        }
+        Err(error) => {
+            session_guard.cancel().await;
+            return Err(error.into());
+        }
+    };
+    if let Some(transfer) = state
+        .outgoing_transfers
+        .write()
+        .await
+        .iter_mut()
+        .find(|transfer| transfer.id == transfer_id)
+    {
+        transfer.total_bytes = accepted_total_bytes;
+    }
+
+    let mut completed_ids = HashSet::new();
+    let mut completed_bytes = 0_u64;
+    for (file_id, token) in &prepared.files {
+        let upload = by_id
+            .get(file_id.as_str())
+            .expect("accepted file IDs were validated");
+        let progress = transferred_bytes.clone();
+        let base = completed_bytes;
+        let upload_timeout =
+            Duration::from_secs(120_u64.saturating_add(upload.size.saturating_div(1024 * 1024)));
+        let result = tokio::time::timeout(
+            upload_timeout,
+            client.upload(
                 protocol,
                 host,
                 target.port,
                 registration.public_key.clone(),
-                &prepared.session_id,
+                &session_id,
                 file_id,
                 token,
-                upload_body(FileContent::Path(upload.path.clone())),
+                upload_body(upload.file_content(), move |sent| {
+                    progress.store(
+                        base.saturating_add(sent).min(accepted_total_bytes),
+                        Ordering::Relaxed,
+                    );
+                }),
                 CancellationToken::new(),
-            )
-            .await
-            .map_err(|error| ApiError::bad_gateway(error.to_string()))?;
+            ),
+        )
+        .await
+        .map_err(|_| ApiError::bad_gateway("File upload timed out"))
+        .and_then(|result| result.map_err(|error| ApiError::bad_gateway(error.to_string())));
+        if let Err(error) = result {
+            session_guard.cancel().await;
+            return Err(SendFailure {
+                error,
+                completed_ids,
+                completed_bytes,
+            });
+        }
+        completed_ids.insert(file_id.clone());
+        completed_bytes = completed_bytes.saturating_add(upload.size);
+        transferred_bytes.store(completed_bytes.min(accepted_total_bytes), Ordering::Relaxed);
     }
+    session_guard.complete().await;
 
-    Ok(prepared.files.len())
+    Ok(SendOutcome {
+        accepted_ids: completed_ids,
+        total_bytes: accepted_total_bytes,
+    })
 }
 
-fn upload_body(content: FileContent) -> reqwest::Body {
-    let stream = ReceiverStream::new(content.into_receiver()).map(Ok::<Bytes, anyhow::Error>);
+fn file_metadata(upload: &TempUpload) -> FileDto {
+    FileDto {
+        id: upload.id.0.clone(),
+        file_name: upload.original_name.clone(),
+        size: upload.size,
+        file_type: upload.content_type.clone(),
+        sha256: None,
+        preview: upload.preview.clone(),
+        metadata: None,
+    }
+}
+
+fn upload_body(content: FileContent, progress: impl Fn(u64) + Send + 'static) -> reqwest::Body {
+    let mut sent = 0_u64;
+    let stream = ReceiverStream::new(content.into_receiver()).map(move |chunk| {
+        sent = sent.saturating_add(chunk.len() as u64);
+        progress(sent);
+        Ok::<Bytes, anyhow::Error>(chunk)
+    });
     reqwest::Body::wrap_stream(stream)
+}
+
+fn deduplicate_targets(targets: &mut Vec<DeviceInfo>) {
+    let mut seen = HashSet::new();
+    targets
+        .retain(|target| seen.insert((target.fingerprint.clone(), target.ip.clone(), target.port)));
+}
+
+fn validate_target_count(targets: &[DeviceInfo]) -> Result<(), ApiError> {
+    if targets.len() > MAX_SEND_TARGETS {
+        return Err(ApiError::bad_request(format!(
+            "Select no more than {MAX_SEND_TARGETS} target devices"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_known_targets(state: &AppState, targets: &[DeviceInfo]) -> Result<(), ApiError> {
+    let known = state.active_devices();
+    if targets.iter().all(|target| {
+        known.iter().any(|candidate| {
+            candidate.device.fingerprint == target.fingerprint
+                && candidate.device.ip == target.ip
+                && candidate.device.port == target.port
+                && candidate.device.protocol == target.protocol
+        })
+    }) {
+        return Ok(());
+    }
+    Err(ApiError::bad_request(
+        "Refresh discovery or connect to each target before sending",
+    ))
 }
 
 fn safe_file_name(value: &str) -> String {
@@ -800,8 +1425,33 @@ fn safe_file_name(value: &str) -> String {
 
 async fn cleanup_uploads(uploads: &[TempUpload]) {
     for upload in uploads {
-        let _ = tokio::fs::remove_file(&upload.path).await;
+        if let TempUploadContent::Path(path) = &upload.content {
+            let _ = tokio::fs::remove_file(path).await;
+        }
     }
+}
+
+pub(crate) async fn cleanup_stale_temp_uploads(temp_dir: &Path) -> anyhow::Result<()> {
+    let mut entries = match tokio::fs::read_dir(temp_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    while let Some(entry) = entries.next_entry().await? {
+        if !entry.file_type().await?.is_file() {
+            continue;
+        }
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if let Some(id) = name.strip_prefix(TEMP_UPLOAD_PREFIX)
+            && Uuid::parse_str(id).is_ok()
+        {
+            let _ = tokio::fs::remove_file(entry.path()).await;
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -862,9 +1512,114 @@ impl IntoResponse for ApiError {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::{
+        collections::HashSet,
+        net::{IpAddr, Ipv4Addr},
+    };
 
-    use super::{parse_probe_address, safe_file_name};
+    use super::{
+        MAX_SEND_TARGETS, TEMP_UPLOAD_PREFIX, TempUpload, TempUploadContent, build_text_upload,
+        cleanup_stale_temp_uploads, deduplicate_targets, file_metadata, outgoing_transfer_records,
+        parse_probe_address, queue_discovery_scan, safe_file_name, validate_target_count,
+    };
+    use crate::network::DiscoveryCommand;
+    use localsendy_core::{DeviceInfo, Protocol};
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn coalesces_duplicate_discovery_scans() {
+        let (scan_tx, mut scan_rx) = mpsc::channel(1);
+
+        queue_discovery_scan(&scan_tx).unwrap();
+        queue_discovery_scan(&scan_tx).unwrap();
+
+        assert!(matches!(scan_rx.try_recv(), Ok(DiscoveryCommand::Announce)));
+        assert!(scan_rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn clipboard_text_uses_localsend_message_metadata() {
+        let upload = build_text_upload("Hello 局域网", 1024).unwrap();
+        let metadata = file_metadata(&upload);
+
+        assert_eq!(metadata.file_type, "text/plain");
+        assert_eq!(metadata.preview.as_deref(), Some("Hello 局域网"));
+        assert!(metadata.file_name.ends_with(".txt"));
+        let TempUploadContent::Bytes(content) = &upload.content else {
+            panic!("clipboard text should remain in memory");
+        };
+        assert_eq!(content.as_ref(), "Hello 局域网".as_bytes());
+    }
+
+    #[test]
+    fn staged_upload_is_removed_when_its_guard_drops() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("staged-file");
+        std::fs::write(&path, b"payload").unwrap();
+        let upload = TempUpload {
+            id: localsendy_core::FileId::new(),
+            original_name: "payload.bin".to_owned(),
+            content_type: "application/octet-stream".to_owned(),
+            size: 7,
+            content: TempUploadContent::Path(path.clone()),
+            preview: None,
+            is_clipboard: false,
+        };
+
+        drop(upload);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn outgoing_batch_preserves_files_completed_before_a_later_failure() {
+        let first = build_text_upload("first", 1024).unwrap();
+        let second = build_text_upload("second", 1024).unwrap();
+        let completed = HashSet::from([first.id.as_str().to_owned()]);
+        let target = DeviceInfo {
+            alias: "Phone".to_owned(),
+            version: "2.1".to_owned(),
+            device_model: None,
+            device_type: None,
+            fingerprint: "fingerprint".to_owned(),
+            port: 53317,
+            protocol: Protocol::Https,
+            download: false,
+            ip: Some("192.168.1.10".to_owned()),
+        };
+
+        let records = outgoing_transfer_records(
+            "single".to_owned(),
+            uuid::Uuid::new_v4(),
+            &target,
+            &[first, second],
+            Some(&completed),
+            Some("second upload failed"),
+        );
+
+        assert_eq!(records[0].status, "completed");
+        assert!(records[0].error.is_none());
+        assert_eq!(records[1].status, "failed");
+        assert_eq!(records[1].error.as_deref(), Some("second upload failed"));
+    }
+
+    #[tokio::test]
+    async fn startup_cleanup_only_removes_owned_temp_uploads() {
+        let directory = tempfile::tempdir().unwrap();
+        let current = directory
+            .path()
+            .join(format!("{TEMP_UPLOAD_PREFIX}{}", uuid::Uuid::new_v4()));
+        let legacy = directory.path().join(uuid::Uuid::new_v4().to_string());
+        let unrelated = directory.path().join("keep-me.txt");
+        tokio::fs::write(&current, b"current").await.unwrap();
+        tokio::fs::write(&legacy, b"legacy").await.unwrap();
+        tokio::fs::write(&unrelated, b"unrelated").await.unwrap();
+
+        cleanup_stale_temp_uploads(directory.path()).await.unwrap();
+
+        assert!(!current.exists());
+        assert!(legacy.exists());
+        assert!(unrelated.exists());
+    }
 
     #[test]
     fn strips_untrusted_path_components() {
@@ -880,5 +1635,50 @@ mod tests {
         );
         assert_eq!(parse_probe_address("192.168.1.50:54000").unwrap().1, 54000);
         assert!(parse_probe_address("example.com").is_err());
+    }
+
+    #[test]
+    fn deduplicates_only_identical_device_endpoints() {
+        let device = DeviceInfo {
+            alias: "Phone".to_owned(),
+            version: "2.1".to_owned(),
+            device_model: None,
+            device_type: None,
+            fingerprint: "fingerprint".to_owned(),
+            port: 53317,
+            protocol: Protocol::Https,
+            download: false,
+            ip: Some("192.168.1.10".to_owned()),
+        };
+        let mut devices = vec![
+            device.clone(),
+            device.clone(),
+            DeviceInfo {
+                port: 53318,
+                ..device
+            },
+        ];
+
+        deduplicate_targets(&mut devices);
+
+        assert_eq!(devices.len(), 2);
+    }
+
+    #[test]
+    fn rejects_unbounded_multi_device_batches() {
+        let device = DeviceInfo {
+            alias: "Phone".to_owned(),
+            version: "2.1".to_owned(),
+            device_model: None,
+            device_type: None,
+            fingerprint: "fingerprint".to_owned(),
+            port: 53317,
+            protocol: Protocol::Https,
+            download: false,
+            ip: Some("192.168.1.10".to_owned()),
+        };
+        let targets = vec![device; MAX_SEND_TARGETS + 1];
+
+        assert!(validate_target_count(&targets).is_err());
     }
 }

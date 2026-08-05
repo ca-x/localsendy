@@ -7,7 +7,7 @@ services:
     restart: unless-stopped
     network_mode: host
     environment:
-      LOCALSENDY_BIND: ${LOCALSENDY_BIND:-0.0.0.0:8080}
+      LOCALSENDY_BIND: ${LOCALSENDY_BIND:-0.0.0.0:52222}
       LOCALSENDY_ALIAS_PREFIX: ${LOCALSENDY_ALIAS_PREFIX:-}
       LOCALSENDY_ALIAS_LOCALE: ${LOCALSENDY_ALIAS_LOCALE:-auto}
       LOCALSENDY_DEVICE_TYPE: ${LOCALSENDY_DEVICE_TYPE:-server}

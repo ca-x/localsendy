@@ -3,9 +3,13 @@ import type { ChangeEvent, DragEvent, ReactNode } from 'react';
 import {
   ArrowLeft,
   Check,
+  CheckCircle2,
   ChevronRight,
+  ClipboardPaste,
   CircleAlert,
+  Clock3,
   File,
+  FileText,
   FolderOpen,
   FolderPlus,
   HardDrive,
@@ -30,6 +34,7 @@ import {
   decidePending,
   getDevices,
   getHistory,
+  getIncomingTransfers,
   getNetworkSettings,
   getPending,
   getStatus,
@@ -38,14 +43,17 @@ import {
   probeDevice,
   scanDevices,
   sendFiles,
+  sendText,
   listStorageDirectories,
   updateStorageSettings,
   updateNetworkSettings,
 } from './api';
+import type { UploadProgress } from './api';
 import { detectLocale, messages } from './i18n';
 import { formatBytes, formatTime } from './format';
 import type {
   DeviceInfo,
+  IncomingTransfer,
   Locale,
   NetworkInterfaceInfo,
   NetworkMode,
@@ -60,13 +68,17 @@ import type {
 } from './types';
 
 type Theme = 'system' | 'light' | 'dark';
+type SendMode = 'files' | 'text';
 type IconComponent = typeof SendIcon;
+const MAX_CLIPBOARD_BYTES = 1024 * 1024;
 
 const navItems: Array<{ id: Tab; icon: IconComponent; label: string }> = [
   { id: 'send', icon: SendIcon, label: 'send' },
   { id: 'receive', icon: Inbox, label: 'receive' },
   { id: 'settings', icon: SettingsIcon, label: 'settings' },
 ];
+
+const deviceKey = (device: DeviceInfo) => `${device.fingerprint}:${device.ip ?? ''}:${device.port}`;
 
 export default function App() {
   const [locale, setLocale] = useState<Locale>(detectLocale);
@@ -77,12 +89,16 @@ export default function App() {
   const [pending, setPending] = useState<PendingTransfer | null>(null);
   const [history, setHistory] = useState<ReceivedFile[]>([]);
   const [transfers, setTransfers] = useState<OutgoingTransfer[]>([]);
-  const [selectedDevice, setSelectedDevice] = useState<DeviceInfo | null>(null);
+  const [incomingTransfers, setIncomingTransfers] = useState<IncomingTransfer[]>([]);
+  const [selectedDeviceIds, setSelectedDeviceIds] = useState<Set<string>>(new Set());
   const [files, setFiles] = useState<File[]>([]);
+  const [sendMode, setSendMode] = useState<SendMode>('files');
+  const [textMessage, setTextMessage] = useState('');
   const [isScanning, setIsScanning] = useState(false);
   const [manualAddress, setManualAddress] = useState('');
   const [isProbing, setIsProbing] = useState(false);
   const [isSending, setIsSending] = useState(false);
+  const [browserUploadProgress, setBrowserUploadProgress] = useState<UploadProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -91,32 +107,46 @@ export default function App() {
 
   const refresh = useCallback(async () => {
     try {
-      const [nextStatus, nextDevices, nextPending, nextHistory, nextTransfers] = await Promise.all([
+      const [nextStatus, nextDevices, nextPending, nextHistory, nextTransfers, nextIncomingTransfers] = await Promise.all([
         getStatus(),
         getDevices(),
         getPending(),
         getHistory(),
         getTransfers(),
+        getIncomingTransfers(),
       ]);
       setStatus(nextStatus);
       setDevices(nextDevices);
       setPending(nextPending);
       setHistory(nextHistory);
       setTransfers(nextTransfers);
-      setSelectedDevice((current) =>
-        current ? nextDevices.find((device) => device.fingerprint === current.fingerprint) ?? null : null,
-      );
+      setIncomingTransfers(nextIncomingTransfers);
+      setSelectedDeviceIds((current) => new Set(
+        nextDevices.filter((device) => current.has(deviceKey(device))).map(deviceKey),
+      ));
       setError(null);
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : copy.error);
     }
   }, [copy.error]);
 
+  const hasActiveTransfers = transfers.some((transfer) => transfer.status === 'preparing' || transfer.status === 'sending')
+    || incomingTransfers.some((transfer) => transfer.status === 'waiting' || transfer.status === 'receiving');
+
   useEffect(() => {
-    refresh();
-    const timer = window.setInterval(refresh, 2500);
-    return () => window.clearInterval(timer);
-  }, [refresh]);
+    let cancelled = false;
+    let timer: number | undefined;
+    const interval = isSending || hasActiveTransfers ? 500 : 2500;
+    const poll = async () => {
+      await refresh();
+      if (!cancelled) timer = window.setTimeout(poll, interval);
+    };
+    void poll();
+    return () => {
+      cancelled = true;
+      if (timer !== undefined) window.clearTimeout(timer);
+    };
+  }, [hasActiveTransfers, isSending, refresh]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -127,6 +157,12 @@ export default function App() {
     document.documentElement.lang = locale;
     localStorage.setItem('localsendy-locale', locale);
   }, [locale]);
+
+  useEffect(() => {
+    if (!notice) return undefined;
+    const timer = window.setTimeout(() => setNotice(null), 5000);
+    return () => window.clearTimeout(timer);
+  }, [notice]);
 
   async function handleScan() {
     setIsScanning(true);
@@ -147,7 +183,7 @@ export default function App() {
     setError(null);
     try {
       const device = await probeDevice(manualAddress.trim());
-      setSelectedDevice(device);
+      setSelectedDeviceIds((current) => new Set(current).add(deviceKey(device)));
       setManualAddress('');
       setNotice(`${copy.deviceAdded}: ${device.alias}`);
       await refresh();
@@ -177,18 +213,37 @@ export default function App() {
   }
 
   async function handleSend() {
-    if (!selectedDevice || files.length === 0) return;
+    const targets = devices.filter((device) => selectedDeviceIds.has(deviceKey(device)));
+    if (targets.length === 0) return;
+    if (sendMode === 'files' && files.length === 0) return;
+    if (sendMode === 'text' && !textMessage.trim()) return;
     setIsSending(true);
+    setBrowserUploadProgress(sendMode === 'files' ? {
+      loaded: 0,
+      total: files.reduce((total, file) => total + file.size, 0),
+    } : null);
     setError(null);
+    setNotice(null);
     try {
-      await sendFiles(selectedDevice, files);
-      setFiles([]);
-      setNotice(copy.transferComplete);
+      const result = sendMode === 'files'
+        ? await sendFiles(targets, files, undefined, setBrowserUploadProgress)
+        : await sendText(targets, textMessage);
+      const succeeded = result.transfers.filter((transfer) => transfer.success);
+      const failed = result.transfers.filter((transfer) => !transfer.success);
       await refresh();
+      if (succeeded.length > 0) {
+        if (sendMode === 'files') setFiles([]);
+        else setTextMessage('');
+        setNotice(`${copy.transferComplete}: ${succeeded.length} / ${targets.length}`);
+      }
+      if (failed.length > 0) {
+        setError(failed.map((transfer) => `${transfer.targetAlias}: ${transfer.error ?? copy.transferFailed}`).join('\n'));
+      }
     } catch (requestError) {
       setError(requestError instanceof Error ? requestError.message : copy.transferFailed);
     } finally {
       setIsSending(false);
+      setBrowserUploadProgress(null);
     }
   }
 
@@ -203,6 +258,16 @@ export default function App() {
   }
 
   const nav = (id: Tab) => setActiveTab(id);
+
+  function toggleDevice(device: DeviceInfo) {
+    const key = deviceKey(device);
+    setSelectedDeviceIds((current) => {
+      const next = new Set(current);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  }
 
   return (
     <div className="app-shell">
@@ -226,7 +291,7 @@ export default function App() {
         </nav>
         <div className="sidebar-footer">
           <StatusPill status={status} copy={copy} />
-          <span className="version-label">v{status?.version ?? '0.1.0'}</span>
+          <span className="version-label">v{status?.version ?? '0.2.0'}</span>
         </div>
       </aside>
 
@@ -274,18 +339,24 @@ export default function App() {
           <SendView
             copy={copy}
             devices={devices}
-            selectedDevice={selectedDevice}
+            selectedDeviceIds={selectedDeviceIds}
             files={files}
+            transfers={transfers}
+            sendMode={sendMode}
+            textMessage={textMessage}
             isScanning={isScanning}
             manualAddress={manualAddress}
             isProbing={isProbing}
             isSending={isSending}
+            browserUploadProgress={browserUploadProgress}
             isDragging={isDragging}
             fileInputRef={fileInputRef}
             onScan={handleScan}
             onManualAddress={setManualAddress}
             onProbe={handleProbe}
-            onSelectDevice={setSelectedDevice}
+            onSelectDevice={toggleDevice}
+            onSendMode={setSendMode}
+            onTextMessage={setTextMessage}
             onFileInput={handleFileInput}
             onDrop={handleDrop}
             onDragState={setIsDragging}
@@ -294,7 +365,7 @@ export default function App() {
             onSend={handleSend}
           />
         ) : null}
-        {activeTab === 'receive' ? <ReceiveView copy={copy} status={status} pending={pending} history={history} onDecision={handlePending} /> : null}
+        {activeTab === 'receive' ? <ReceiveView copy={copy} status={status} pending={pending} history={history} incomingTransfers={incomingTransfers} onDecision={handlePending} /> : null}
         {activeTab === 'settings' ? <SettingsView copy={copy} locale={locale} theme={theme} status={status} onLocale={setLocale} onTheme={setTheme} onError={setError} onNotice={setNotice} /> : null}
       </main>
 
@@ -327,18 +398,24 @@ function StatusPill({ status, copy }: { status: StatusResponse | null; copy: Rec
 function SendView(props: {
   copy: Record<string, string>;
   devices: DeviceInfo[];
-  selectedDevice: DeviceInfo | null;
+  selectedDeviceIds: Set<string>;
   files: File[];
+  transfers: OutgoingTransfer[];
+  sendMode: SendMode;
+  textMessage: string;
   isScanning: boolean;
   manualAddress: string;
   isProbing: boolean;
   isSending: boolean;
+  browserUploadProgress: UploadProgress | null;
   isDragging: boolean;
   fileInputRef: React.RefObject<HTMLInputElement | null>;
   onScan: () => void;
   onManualAddress: (address: string) => void;
   onProbe: () => void;
   onSelectDevice: (device: DeviceInfo) => void;
+  onSendMode: (mode: SendMode) => void;
+  onTextMessage: (text: string) => void;
   onFileInput: (event: ChangeEvent<HTMLInputElement>) => void;
   onDrop: (event: DragEvent<HTMLDivElement>) => void;
   onDragState: (state: boolean) => void;
@@ -347,6 +424,21 @@ function SendView(props: {
   onSend: () => void;
 }) {
   const { copy } = props;
+  const [clipboardError, setClipboardError] = useState<string | null>(null);
+  const selectedCount = props.selectedDeviceIds.size;
+  const textBytes = new TextEncoder().encode(props.textMessage).length;
+  const textTooLarge = textBytes > MAX_CLIPBOARD_BYTES;
+  const payloadReady = props.sendMode === 'files' ? props.files.length > 0 : props.textMessage.trim().length > 0 && !textTooLarge;
+
+  async function pasteClipboard() {
+    setClipboardError(null);
+    try {
+      props.onTextMessage(await navigator.clipboard.readText());
+    } catch {
+      setClipboardError(copy.clipboardUnavailable);
+    }
+  }
+
   return (
     <section className="workspace send-workspace">
       <div className="page-intro">
@@ -358,29 +450,48 @@ function SendView(props: {
         <div className="protocol-note"><ShieldCheck size={17} aria-hidden="true" /><span>HTTPS / LocalSend v2</span></div>
       </div>
 
+      <div className="send-mode-control" role="tablist" aria-label={copy.sendContentType}>
+        <button type="button" role="tab" aria-selected={props.sendMode === 'files'} className={props.sendMode === 'files' ? 'active' : ''} onClick={() => props.onSendMode('files')}><File size={17} aria-hidden="true" />{copy.files}</button>
+        <button type="button" role="tab" aria-selected={props.sendMode === 'text'} className={props.sendMode === 'text' ? 'active' : ''} onClick={() => props.onSendMode('text')}><FileText size={17} aria-hidden="true" />{copy.clipboardText}</button>
+      </div>
+
       <div className="send-grid">
         <div className="send-column">
-          <div className="section-heading"><div><h2>{copy.chooseFiles}</h2><p>{copy.fileHint}</p></div>{props.files.length > 0 ? <button className="text-button" type="button" onClick={props.onClearFiles}>{copy.clear}</button> : null}</div>
-          <div
-            className={`dropzone ${props.isDragging ? 'dragging' : ''}`}
-            onDragEnter={(event) => { event.preventDefault(); props.onDragState(true); }}
-            onDragOver={(event) => event.preventDefault()}
-            onDragLeave={(event) => { if (event.currentTarget === event.target) props.onDragState(false); }}
-            onDrop={props.onDrop}
-          >
-            <div className="dropzone-icon"><UploadCloud size={25} aria-hidden="true" /></div>
-            <strong>{copy.dropFiles}</strong>
-            <span>{copy.fileHint}</span>
-            <button className="secondary-button" type="button" onClick={() => props.fileInputRef.current?.click()}><FolderOpen size={17} aria-hidden="true" />{copy.chooseFiles}</button>
-            <input ref={props.fileInputRef} className="sr-only" type="file" multiple onChange={props.onFileInput} />
-          </div>
-
-          {props.files.length > 0 ? <div className="file-list-section"><div className="section-heading compact"><h2>{copy.selectedFiles}<span className="count-badge">{props.files.length}</span></h2></div><div className="file-list">{props.files.map((file, index) => <FileRow key={`${file.name}-${file.lastModified}`} copy={copy} file={file} onRemove={() => props.onRemoveFile(index)} />)}</div></div> : null}
+          {props.sendMode === 'files' ? <>
+            <div className="section-heading"><div><h2>{copy.chooseFiles}</h2><p>{copy.fileHint}</p></div>{props.files.length > 0 ? <button className="text-button" type="button" onClick={props.onClearFiles}>{copy.clear}</button> : null}</div>
+            <div
+              className={`dropzone ${props.isDragging ? 'dragging' : ''}`}
+              onDragEnter={(event) => { event.preventDefault(); props.onDragState(true); }}
+              onDragOver={(event) => event.preventDefault()}
+              onDragLeave={(event) => { if (event.currentTarget === event.target) props.onDragState(false); }}
+              onDrop={props.onDrop}
+            >
+              <div className="dropzone-icon"><UploadCloud size={25} aria-hidden="true" /></div>
+              <strong>{copy.dropFiles}</strong>
+              <span>{copy.fileHint}</span>
+              <button className="secondary-button" type="button" onClick={() => props.fileInputRef.current?.click()}><FolderOpen size={17} aria-hidden="true" />{copy.chooseFiles}</button>
+              <input ref={props.fileInputRef} className="sr-only" type="file" multiple aria-label={copy.chooseFiles} onChange={props.onFileInput} />
+            </div>
+            {props.files.length > 0 ? <div className="file-list-section"><div className="section-heading compact"><h2>{copy.selectedFiles}<span className="count-badge">{props.files.length}</span></h2></div><div className="file-list">{props.files.map((file, index) => <FileRow key={`${file.name}-${file.lastModified}`} copy={copy} file={file} onRemove={() => props.onRemoveFile(index)} />)}</div></div> : null}
+          </> : <div className="text-composer">
+            <div className="section-heading"><div><h2>{copy.clipboardText}</h2><p>{copy.textHint}</p></div></div>
+            <label htmlFor="text-message">{copy.message}</label>
+            <textarea id="text-message" value={props.textMessage} onChange={(event) => props.onTextMessage(event.target.value)} placeholder={copy.textPlaceholder} rows={9} />
+            <div className="text-composer-footer">
+              <span>{props.textMessage.length} {copy.characters} · {formatBytes(textBytes)}</span>
+              <div>
+                <button className="secondary-button" type="button" onClick={pasteClipboard}><ClipboardPaste size={17} aria-hidden="true" />{copy.pasteClipboard}</button>
+                <button className="text-button" type="button" disabled={!props.textMessage} onClick={() => props.onTextMessage('')}>{copy.clear}</button>
+              </div>
+            </div>
+            {clipboardError ? <p className="field-error" role="alert">{clipboardError}</p> : null}
+            {textTooLarge ? <p className="field-error" role="alert">{copy.textTooLarge} ({formatBytes(MAX_CLIPBOARD_BYTES)})</p> : null}
+          </div>}
         </div>
 
         <div className="devices-column">
-          <div className="section-heading"><div><h2>{copy.nearbyDevices}</h2><p>{props.devices.length === 0 ? copy.noDevicesHint : `${props.devices.length} ${copy.online.toLowerCase()}`}</p></div><button className="icon-button outlined" type="button" title={props.isScanning ? copy.scanning : copy.scan} aria-label={props.isScanning ? copy.scanning : copy.scan} onClick={props.onScan} disabled={props.isScanning}>{<RefreshCw size={17} className={props.isScanning ? 'spin' : ''} aria-hidden="true" />}</button></div>
-          {props.devices.length > 0 ? <div className="device-list">{props.devices.map((device) => <DeviceCard key={device.fingerprint} device={device} selected={props.selectedDevice?.fingerprint === device.fingerprint} copy={copy} onSelect={() => props.onSelectDevice(device)} />)}</div> : <div className="empty-device-state"><div className="empty-icon"><Wifi size={22} aria-hidden="true" /></div><strong>{copy.noDevices}</strong><span>{copy.noDevicesHint}</span><button className="secondary-button" type="button" onClick={props.onScan} disabled={props.isScanning}><RefreshCw size={17} className={props.isScanning ? 'spin' : ''} aria-hidden="true" />{props.isScanning ? copy.scanning : copy.scan}</button></div>}
+          <div className="section-heading device-heading"><div><h2>{copy.nearbyDevices}</h2><p>{props.devices.length === 0 ? copy.noDevicesHint : `${selectedCount} ${copy.devicesSelected} · ${props.devices.length} ${copy.online.toLowerCase()}`}</p></div><button className="icon-button outlined" type="button" title={props.isScanning ? copy.scanning : copy.scan} aria-label={props.isScanning ? copy.scanning : copy.scan} onClick={props.onScan} disabled={props.isScanning}><RefreshCw size={17} className={props.isScanning ? 'spin' : ''} aria-hidden="true" /></button></div>
+          {props.devices.length > 0 ? <div className="device-list">{props.devices.map((device) => <DeviceCard key={deviceKey(device)} device={device} selected={props.selectedDeviceIds.has(deviceKey(device))} copy={copy} onSelect={() => props.onSelectDevice(device)} />)}</div> : <div className="empty-device-state"><div className="empty-icon"><Wifi size={22} aria-hidden="true" /></div><strong>{copy.noDevices}</strong><span>{copy.noDevicesHint}</span><button className="secondary-button" type="button" onClick={props.onScan} disabled={props.isScanning}><RefreshCw size={17} className={props.isScanning ? 'spin' : ''} aria-hidden="true" />{props.isScanning ? copy.scanning : copy.scan}</button></div>}
           <div className="manual-target">
             <label htmlFor="manual-address">{copy.manualAddress}</label>
             <p>{copy.manualHint}</p>
@@ -389,8 +500,20 @@ function SendView(props: {
               <button className="secondary-button" type="button" disabled={props.isProbing || !props.manualAddress.trim()} onClick={props.onProbe}>{props.isProbing ? <RefreshCw size={17} className="spin" aria-hidden="true" /> : <Wifi size={17} aria-hidden="true" />}{props.isProbing ? copy.connecting : copy.connect}</button>
             </div>
           </div>
-          <button className="primary-button send-cta" type="button" disabled={!props.selectedDevice || props.files.length === 0 || props.isSending} onClick={props.onSend}>{props.isSending ? <RefreshCw size={18} className="spin" aria-hidden="true" /> : <SendIcon size={18} aria-hidden="true" />}{props.isSending ? copy.sending : props.selectedDevice ? copy.sendFiles : copy.selectDevice}<ChevronRight size={17} aria-hidden="true" /></button>
+          <button className="primary-button send-cta" type="button" disabled={selectedCount === 0 || !payloadReady || props.isSending} onClick={props.onSend}>{props.isSending ? <RefreshCw size={18} className="spin" aria-hidden="true" /> : <SendIcon size={18} aria-hidden="true" />}{props.isSending ? copy.sending : selectedCount > 0 ? `${copy.sendToDevices} (${selectedCount})` : copy.selectDevice}<ChevronRight size={17} aria-hidden="true" /></button>
+          {props.browserUploadProgress ? <div className="browser-upload-progress"><ProgressBar
+            value={props.browserUploadProgress.loaded}
+            total={props.browserUploadProgress.total}
+            label={props.browserUploadProgress.total > 0 && props.browserUploadProgress.loaded >= props.browserUploadProgress.total
+              ? copy.uploadStaged
+              : `${copy.uploadingToServer} ${formatBytes(props.browserUploadProgress.loaded)} / ${formatBytes(props.browserUploadProgress.total)}`}
+          /></div> : null}
         </div>
+      </div>
+
+      <div className="transfer-history-section">
+        <div className="section-heading"><div><h2>{copy.sendHistory}</h2><p>{copy.sendHistoryHint}</p></div><span className="count-badge">{props.transfers.length}</span></div>
+        {props.transfers.length > 0 ? <div className="transfer-list">{props.transfers.slice(0, 12).map((transfer) => <OutgoingTransferRow key={transfer.id} transfer={transfer} copy={copy} />)}</div> : <div className="compact-empty"><Clock3 size={19} aria-hidden="true" /><span>{copy.noSendHistory}</span></div>}
       </div>
     </section>
   );
@@ -406,8 +529,48 @@ function DeviceCard({ device, selected, copy, onSelect }: { device: DeviceInfo; 
   return <button type="button" className={`device-card ${selected ? 'selected' : ''}`} onClick={onSelect} aria-pressed={selected}><span className="device-icon"><Icon size={20} aria-hidden="true" /></span><span className="device-card-copy"><strong>{device.alias}</strong><span>{device.ip ?? 'LocalSend'} · {device.deviceModel ?? device.deviceType ?? 'device'}</span>{source ? <small>{copy.viaInterface} {source}</small> : null}</span><span className={`device-check ${selected ? 'visible' : ''}`}><Check size={16} aria-hidden="true" /></span></button>;
 }
 
-function ReceiveView({ copy, status, pending, history, onDecision }: { copy: Record<string, string>; status: StatusResponse | null; pending: PendingTransfer | null; history: ReceivedFile[]; onDecision: (decision: 'accept' | 'reject') => void }) {
-  return <section className="workspace"><div className="page-intro compact-intro"><div><p className="eyebrow"><Inbox size={14} aria-hidden="true" /> {copy.inboxLabel.toUpperCase()}</p><h1>{copy.incoming}</h1><p className="page-subhead">{copy.waiting}</p></div></div><div className="receive-grid"><div className="receive-main">{pending ? <div className="pending-panel"><div className="pending-header"><div className="sender-avatar"><Laptop size={20} aria-hidden="true" /></div><div><span className="eyebrow">{copy.waiting}</span><h2>{pending.sender.alias}</h2><p>{copy.from} {pending.sender.ip ?? 'LAN'} · {pending.files.length} {copy.selectedFiles.toLowerCase()}</p></div></div><div className="pending-files">{pending.files.map((file) => <div key={file.id} className="pending-file"><File size={16} aria-hidden="true" /><span>{file.name}</span><span>{formatBytes(file.size)}</span></div>)}</div><div className="pending-total"><span>{copy.selectedFiles}</span><strong>{formatBytes(pending.totalBytes)}</strong></div><div className="pending-actions"><button className="secondary-button danger-outline" type="button" onClick={() => onDecision('reject')}><X size={17} aria-hidden="true" />{copy.reject}</button><button className="primary-button" type="button" onClick={() => onDecision('accept')}><Check size={17} aria-hidden="true" />{copy.accept}</button></div></div> : <div className="empty-panel"><div className="empty-icon"><Inbox size={22} aria-hidden="true" /></div><strong>{copy.noPending}</strong><span>{copy.waiting}</span></div>}</div><aside className="receive-side"><div className="side-panel"><div className="side-panel-heading"><h2>{copy.localNode}</h2><span className="status-tag"><span className="status-dot" />{copy.online}</span></div><div className="node-name">{status?.alias ?? copy.brand}</div><dl className="detail-list"><div><dt>{copy.protocol}</dt><dd>{status?.protocol?.toUpperCase() ?? 'HTTPS'}</dd></div><div><dt>{copy.port}</dt><dd>{status?.localsendPort ?? 53317}</dd></div><div><dt>{copy.downloads}</dt><dd title={status?.dataDirectory}>{status?.dataDirectory ?? '/data/downloads'}</dd></div></dl></div><div className="side-panel history-panel"><div className="side-panel-heading"><h2>{copy.history}</h2><span className="count-badge">{history.length}</span></div>{history.length > 0 ? <div className="history-list">{history.slice(0, 5).map((file, index) => <div key={`${file.fileName}-${index}`} className="history-row"><div className="file-type-icon"><File size={16} aria-hidden="true" /></div><div className="file-row-copy"><strong title={file.fileName}>{file.fileName}</strong><span>{file.sender} · {formatTime(file.time)}</span></div><span className="history-size">{formatBytes(file.size)}</span></div>)}</div> : <p className="empty-copy">{copy.noHistory}</p>}</div></aside></div></section>;
+function ProgressBar({ value, total, label }: { value: number; total: number; label: string }) {
+  const percent = total > 0 ? Math.min(100, Math.round((value / total) * 100)) : 0;
+  return <div className="progress-group"><div className="progress-meta"><span>{label}</span><strong>{percent}%</strong></div><div className="progress-track" role="progressbar" aria-label={label} aria-valuetext={`${percent}%`} aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent}><span style={{ transform: `scaleX(${percent / 100})` }} /></div></div>;
+}
+
+function OutgoingTransferRow({ transfer, copy }: { transfer: OutgoingTransfer; copy: Record<string, string> }) {
+  const isText = transfer.isClipboard;
+  const active = transfer.status === 'preparing' || transfer.status === 'sending';
+  const StatusIcon = transfer.status === 'completed' ? CheckCircle2 : transfer.status === 'failed' ? CircleAlert : RefreshCw;
+  const statusLabel = copy[`transferStatus${transfer.status[0].toUpperCase()}${transfer.status.slice(1)}`];
+  return <article className="transfer-row">
+    <div className={`transfer-kind-icon ${isText ? 'text' : ''}`}>{isText ? <FileText size={18} aria-hidden="true" /> : <File size={18} aria-hidden="true" />}</div>
+    <div className="transfer-row-main">
+      <div className="transfer-title"><strong>{isText ? copy.clipboardText : transfer.fileNames.length === 1 ? transfer.fileNames[0] : `${transfer.fileNames.length} ${copy.files}`}</strong><span className={`transfer-status ${transfer.status}`}><StatusIcon size={14} className={active ? 'spin' : ''} aria-hidden="true" />{statusLabel}</span></div>
+      <p className="transfer-detail">{copy.to} {transfer.targetAlias} · {formatTime(transfer.createdAt)} · {formatBytes(transfer.totalBytes)}</p>
+      {active ? <ProgressBar value={transfer.transferredBytes} total={transfer.totalBytes} label={`${copy.sending} ${formatBytes(transfer.transferredBytes)} / ${formatBytes(transfer.totalBytes)}`} /> : null}
+      {transfer.error ? <p className="transfer-error">{transfer.error}</p> : null}
+    </div>
+  </article>;
+}
+
+function ReceiveView({ copy, status, pending, history, incomingTransfers, onDecision }: { copy: Record<string, string>; status: StatusResponse | null; pending: PendingTransfer | null; history: ReceivedFile[]; incomingTransfers: IncomingTransfer[]; onDecision: (decision: 'accept' | 'reject') => void }) {
+  return <section className="workspace">
+    <div className="page-intro compact-intro"><div><p className="eyebrow"><Inbox size={14} aria-hidden="true" /> {copy.inboxLabel.toUpperCase()}</p><h1>{copy.incoming}</h1><p className="page-subhead">{copy.receiveSubhead}</p></div></div>
+    <div className="receive-grid">
+      <div className="receive-main">
+        {pending ? <div className="pending-panel"><div className="pending-header"><div className="sender-avatar"><Laptop size={20} aria-hidden="true" /></div><div><span className="eyebrow">{copy.waiting}</span><h2>{pending.sender.alias}</h2><p>{copy.from} {pending.sender.ip ?? 'LAN'} · {pending.files.length} {copy.selectedFiles.toLowerCase()}</p></div></div><div className="pending-files">{pending.files.map((file) => <div key={file.id} className="pending-file"><File size={16} aria-hidden="true" /><span>{file.name}</span><span>{formatBytes(file.size)}</span></div>)}</div><div className="pending-total"><span>{copy.selectedFiles}</span><strong>{formatBytes(pending.totalBytes)}</strong></div><div className="pending-actions"><button className="secondary-button danger-outline" type="button" onClick={() => onDecision('reject')}><X size={17} aria-hidden="true" />{copy.reject}</button><button className="primary-button" type="button" onClick={() => onDecision('accept')}><Check size={17} aria-hidden="true" />{copy.accept}</button></div></div> : null}
+        <div className="incoming-activity-panel">
+          <div className="section-heading"><div><h2>{copy.receiveActivity}</h2><p>{copy.receiveActivityHint}</p></div><span className="count-badge">{incomingTransfers.length}</span></div>
+          {incomingTransfers.length > 0 ? <div className="incoming-transfer-list">{incomingTransfers.slice(0, 12).map((transfer) => <IncomingTransferRow key={transfer.id} transfer={transfer} copy={copy} />)}</div> : !pending ? <div className="compact-empty"><Inbox size={20} aria-hidden="true" /><span>{copy.noPending}</span></div> : null}
+        </div>
+      </div>
+      <aside className="receive-side"><div className="side-panel"><div className="side-panel-heading"><h2>{copy.localNode}</h2><span className="status-tag"><span className="status-dot" />{copy.online}</span></div><div className="node-name">{status?.alias ?? copy.brand}</div><dl className="detail-list"><div><dt>{copy.protocol}</dt><dd>{status?.protocol?.toUpperCase() ?? 'HTTPS'}</dd></div><div><dt>{copy.port}</dt><dd>{status?.localsendPort ?? 53317}</dd></div><div><dt>{copy.downloads}</dt><dd title={status?.dataDirectory}>{status?.dataDirectory ?? '/data/downloads'}</dd></div></dl></div><div className="side-panel history-panel"><div className="side-panel-heading"><h2>{copy.history}</h2><span className="count-badge">{history.length}</span></div>{history.length > 0 ? <div className="history-list">{history.slice(0, 8).map((file, index) => <div key={`${file.fileName}-${index}`} className="history-row"><div className="file-type-icon"><File size={16} aria-hidden="true" /></div><div className="file-row-copy"><strong title={file.fileName}>{file.fileName}</strong><span>{file.sender} · {formatTime(file.time)}</span></div><span className="history-size">{formatBytes(file.size)}</span></div>)}</div> : <p className="empty-copy">{copy.noHistory}</p>}</div></aside>
+    </div>
+  </section>;
+}
+
+function IncomingTransferRow({ transfer, copy }: { transfer: IncomingTransfer; copy: Record<string, string> }) {
+  const active = transfer.status === 'waiting' || transfer.status === 'receiving';
+  const StatusIcon = transfer.status === 'completed' ? CheckCircle2 : transfer.status === 'failed' ? CircleAlert : RefreshCw;
+  const statusLabel = copy[`incomingStatus${transfer.status[0].toUpperCase()}${transfer.status.slice(1)}`];
+  return <article className="transfer-row incoming-transfer-row"><div className="transfer-kind-icon incoming"><File size={18} aria-hidden="true" /></div><div className="transfer-row-main"><div className="transfer-title"><strong title={transfer.fileName}>{transfer.fileName}</strong><span className={`transfer-status ${transfer.status}`}><StatusIcon size={14} className={active && transfer.status === 'receiving' ? 'spin' : ''} aria-hidden="true" />{statusLabel}</span></div><p className="transfer-detail">{copy.from} {transfer.senderAlias} · {formatTime(transfer.createdAt)} · {formatBytes(transfer.totalBytes)}</p>{active ? <ProgressBar value={transfer.transferredBytes} total={transfer.totalBytes} label={`${copy.receiving} ${formatBytes(transfer.transferredBytes)} / ${formatBytes(transfer.totalBytes)}`} /> : null}{transfer.error ? <p className="transfer-error">{transfer.error}</p> : null}</div></article>;
 }
 
 function SettingsView({ copy, locale, theme, status, onLocale, onTheme, onError, onNotice }: { copy: Record<string, string>; locale: Locale; theme: Theme; status: StatusResponse | null; onLocale: (locale: Locale) => void; onTheme: (theme: Theme) => void; onError: (message: string | null) => void; onNotice: (message: string | null) => void }) {
@@ -550,7 +713,10 @@ function SettingsView({ copy, locale, theme, status, onLocale, onTheme, onError,
             </button>
           </div>
           <p className="storage-root-hint">{copy.storageRoot}: <code>{storage?.root ?? copy.loading}</code></p>
-          <div className="setting-row readonly-setting"><div className="setting-label"><Inbox size={18} aria-hidden="true" /><span>{copy.autoAccept}</span></div><strong>{status?.autoAccept ? copy.enabled : copy.disabled}</strong></div>
+          <div className="setting-row readonly-setting">
+            <div className="setting-label"><Inbox size={18} aria-hidden="true" /><span><strong>{copy.autoAccept}</strong><small>{copy.autoAcceptHint}</small></span></div>
+            <strong>{status?.autoAccept ? copy.enabled : copy.disabled}</strong>
+          </div>
         </div>
 
         <div className="settings-section advanced-settings-section deployment-section">
@@ -605,7 +771,7 @@ function SettingsView({ copy, locale, theme, status, onLocale, onTheme, onError,
           </div>
         </div>
 
-        <div className="settings-section deployment-section"><div className="section-heading"><div><h2>{copy.deployment}</h2><p>Docker</p></div><Server size={21} className="section-icon" aria-hidden="true" /></div><p className="deployment-copy">{copy.deploymentHint}</p><div className="setting-row readonly-setting"><div className="setting-label"><ShieldCheck size={18} aria-hidden="true" /><span>{copy.version}</span></div><strong>v{status?.version ?? '0.1.0'}</strong></div></div>
+        <div className="settings-section deployment-section"><div className="section-heading"><div><h2>{copy.deployment}</h2><p>Docker</p></div><Server size={21} className="section-icon" aria-hidden="true" /></div><p className="deployment-copy">{copy.deploymentHint}</p><div className="setting-row readonly-setting"><div className="setting-label"><ShieldCheck size={18} aria-hidden="true" /><span>{copy.version}</span></div><strong>v{status?.version ?? '0.2.0'}</strong></div></div>
       </div>
       {storage ? <StorageDirectoryDialog
         open={isStoragePickerOpen}

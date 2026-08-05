@@ -87,7 +87,39 @@ export interface OutgoingTransfer {
   targetAlias: string;
   fileNames: string[];
   totalBytes: number;
-  status: 'preparing' | 'completed' | 'failed';
+  transferredBytes: number;
+  status: 'preparing' | 'sending' | 'completed' | 'failed';
   createdAt: string;
   error?: string;
+  contentType?: string;
+  isClipboard: boolean;
+}
+
+export interface IncomingTransfer {
+  id: string;
+  sessionId: string;
+  fileId: string;
+  senderAlias: string;
+  fileName: string;
+  totalBytes: number;
+  transferredBytes: number;
+  status: 'waiting' | 'receiving' | 'completed' | 'failed';
+  createdAt: string;
+  error?: string;
+}
+
+export interface SendTargetResult {
+  transferId: string;
+  targetAlias: string;
+  filesSent: number;
+  totalBytes: number;
+  success: boolean;
+  error?: string;
+}
+
+export interface SendResponse {
+  transferId: string;
+  transfers: SendTargetResult[];
+  filesSent: number;
+  totalBytes: number;
 }
