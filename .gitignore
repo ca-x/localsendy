@@ -1,0 +1,16 @@
+/target/
+/.idea/
+/.vscode/
+.DS_Store
+*.log
+.env
+.env.*
+!/web/dist/.gitkeep
+/web/node_modules/
+/web/dist/*
+!/web/dist/.gitkeep
+/web/coverage/
+/web/*.tsbuildinfo
+/web/vite.config.js
+/web/vite.config.d.ts
+/data/

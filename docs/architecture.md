@@ -1,0 +1,39 @@
+# Architecture
+
+Localsendy keeps the browser outside the LocalSend protocol boundary. Rust owns network identity, TLS, discovery, transfer sessions, and filesystem access; React talks only to the local control API.
+
+## Runtime services
+
+| Service | Bind | Responsibility |
+| --- | --- | --- |
+| Web/API | `0.0.0.0:8080` | Embedded React assets and `/api/v1` control endpoints |
+| LocalSend receiver | `0.0.0.0:53317/tcp` | LocalSend v2 HTTPS register, prepare, upload, and cancel endpoints |
+| Discovery | `0.0.0.0:53317/udp`, `[::]:53317/udp` | Automatic multi-interface LocalSend multicast presence and peer discovery |
+
+The receiver creates an ephemeral self-signed certificate at startup and advertises its SHA-256 fingerprint as required by the LocalSend protocol.
+
+## Data flow
+
+### Outgoing
+
+1. The browser streams selected files to `/api/v1/send` as multipart data.
+2. Rust writes each part to a UUID-named temporary file under `/data/tmp` while enforcing the configured request limit.
+3. `localsend-rs` prepares the remote upload and streams accepted files to the target.
+4. Temporary files are removed and an in-memory transfer record is updated.
+
+### Incoming
+
+1. A peer prepares an upload through the LocalSend HTTPS service.
+2. The pending request is exposed to the browser through `/api/v1/pending`.
+3. The user accepts or declines, unless `LOCALSENDY_AUTO_ACCEPT=true`.
+4. Accepted data is written to `/data/downloads` by `localsend-rs`.
+
+## Container networking
+
+Multicast is the reason the default Compose file uses `network_mode: host`. A normal bridge network can publish TCP/UDP ports, but multicast discovery usually does not cross the bridge in the way LocalSend peers expect. In host mode, Localsendy automatically enumerates host interfaces, joins `224.0.0.167:53317` on each eligible IPv4 address and `ff12::fd3a:e420:53317` on each eligible IPv6 interface, and sends announcements through every bound socket. Interface changes are detected at runtime without user selection.
+
+The `/api/v1/networks` settings are an optional advanced override for restricting discovery or assigning interface labels. They persist in `/data/network-settings.json`; `LOCALSENDY_NETWORK_INTERFACES` only supplies the initial fallback when that file does not exist. Multicast still stays inside each multicast domain unless the network provides a relay. Routed IPv6 unicast alone does not guarantee that a VPN or overlay forwards IPv6 multicast.
+
+## Current persistence boundaries
+
+Files and network settings persist under `/data`; device discovery, receive history supplied by the protocol crate, and outgoing transfer records are currently process-local. A later persistence layer can be added without changing the browser API contracts.

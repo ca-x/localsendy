@@ -1,0 +1,19 @@
+services:
+  localsendy:
+    image: ghcr.io/ca-x/localsendy:latest
+    build:
+      context: .
+    container_name: localsendy
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      LOCALSENDY_BIND: 0.0.0.0:8080
+      LOCALSENDY_ALIAS: Localsendy
+      LOCALSENDY_PORT: 53317
+      LOCALSENDY_DATA_DIR: /data
+      LOCALSENDY_DOWNLOAD_DIR: /data/downloads
+      LOCALSENDY_AUTO_ACCEPT: "false"
+      LOCALSENDY_NETWORK_INTERFACES: all
+      RUST_LOG: localsendy=info,tower_http=info
+    volumes:
+      - ./data:/data
