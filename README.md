@@ -75,7 +75,7 @@ Localsendy exposes only settings that the current service can enforce. Automatic
 
 ## Local development
 
-Requirements: Rust 1.94+, Node.js 24+, npm 12+.
+Requirements: Rust 1.97+, Node.js 24+, npm 12+.
 
 ```bash
 npm --prefix web ci

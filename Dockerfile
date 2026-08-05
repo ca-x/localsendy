@@ -7,7 +7,7 @@ RUN --mount=type=cache,target=/root/.npm,sharing=locked npm ci --ignore-scripts
 COPY web/ ./
 RUN npm run build
 
-FROM rust:1.94-bookworm AS rust-builder
+FROM rust:1.97-bookworm AS rust-builder
 WORKDIR /source
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates

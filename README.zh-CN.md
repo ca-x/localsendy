@@ -75,7 +75,7 @@ Localsendy 只展示当前服务能够真实执行的设置。自动接受与保
 
 ## 本地开发与检查
 
-需要 Rust 1.94+、Node.js 24+、npm 12+。
+需要 Rust 1.97+、Node.js 24+、npm 12+。
 
 ```bash
 npm --prefix web ci

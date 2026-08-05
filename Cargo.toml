@@ -2,7 +2,7 @@
 name = "localsendy"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.97"
 license = "MIT"
 description = "A Docker-first LocalSend web client powered by Rust"
 repository = "https://github.com/ca-x/localsendy"

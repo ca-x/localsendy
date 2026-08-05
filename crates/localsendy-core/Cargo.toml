@@ -2,7 +2,7 @@
 name = "localsendy-core"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.94"
+rust-version = "1.97"
 license = "MIT"
 description = "LocalSend protocol and instance primitives used by Localsendy"
 
