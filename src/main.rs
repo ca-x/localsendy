@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod link_share;
 mod network;
 mod state;
 mod storage_path;
@@ -68,6 +69,9 @@ async fn main() -> Result<()> {
     api::cleanup_stale_temp_uploads(&config.temp_dir())
         .await
         .context("failed to clean stale temporary uploads")?;
+    link_share::cleanup_stale_share_files(&config.temp_dir())
+        .await
+        .context("failed to clean stale link-share files")?;
 
     let download_root = config.downloads_dir();
     let configured_subdirectory = database
@@ -218,11 +222,13 @@ async fn main() -> Result<()> {
         receiver_destination,
         scan_tx,
         network_preferences,
+        link_share: link_share::LinkShareStore::default(),
         started_at: Instant::now(),
     };
 
     let app = Router::new()
-        .nest("/api/v1", api::router(state))
+        .nest("/api/v1", api::router(state.clone()))
+        .merge(link_share::public_router(state))
         .fallback(web::static_handler)
         .layer(SetResponseHeaderLayer::if_not_present(
             axum::http::header::X_CONTENT_TYPE_OPTIONS,
@@ -242,9 +248,12 @@ async fn main() -> Result<()> {
         "Official LocalSend Rust server is ready"
     );
 
-    let result = axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await;
+    let result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await;
     receiver.stop().await;
     result?;
     Ok(())

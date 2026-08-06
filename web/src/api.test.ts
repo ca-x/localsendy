@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { scanDevices, sendFiles, sendText, updateEnvironmentSettings } from './api';
+import { scanDevices, sendFiles, sendText, startLinkShare, stopLinkShare, updateEnvironmentSettings } from './api';
 import type { DeviceInfo } from './types';
 
 const target: DeviceInfo = {
@@ -105,5 +105,47 @@ describe('API responses', () => {
     );
 
     expect(onProgress).toHaveBeenCalledWith({ loaded: 5, total: 10 });
+  });
+
+  it('starts one link share with files before opening the share page', async () => {
+    class FakeXmlHttpRequest {
+      status = 200;
+      responseText = JSON.stringify({ active: true, urls: ['http://host/share'], files: [] });
+      upload: { onprogress: ((event: ProgressEvent) => void) | null } = { onprogress: null };
+      onload: (() => void) | null = null;
+      onerror: (() => void) | null = null;
+      onabort: (() => void) | null = null;
+      body?: FormData;
+
+      open(_method: string, path: string) {
+        expect(path).toBe('/api/v1/share');
+      }
+
+      send(body: FormData) {
+        this.body = body;
+        expect(body.get('autoAccept')).toBe('false');
+        expect((body.get('files') as File).name).toBe('share.txt');
+        this.onload?.();
+      }
+    }
+    vi.stubGlobal('XMLHttpRequest', FakeXmlHttpRequest);
+
+    await expect(startLinkShare(
+      [new File(['share'], 'share.txt', { type: 'text/plain' })],
+      false,
+      '',
+      vi.fn(),
+    )).resolves.toMatchObject({ active: true });
+  });
+
+  it('stops only the identified share with a keepalive delete request', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await stopLinkShare('share/id', true);
+
+    const [path, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(path).toBe('/api/v1/share?shareId=share%2Fid');
+    expect(init).toMatchObject({ method: 'DELETE', keepalive: true });
   });
 });

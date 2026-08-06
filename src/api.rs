@@ -79,6 +79,7 @@ pub fn router(state: AppState) -> Router {
             "/send/text",
             post(send_text).layer(DefaultBodyLimit::max(MAX_TEXT_REQUEST_BYTES)),
         )
+        .merge(crate::link_share::control_router())
         .fallback(api_not_found)
         .with_state(state)
 }

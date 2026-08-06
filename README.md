@@ -13,6 +13,7 @@ Localsendy is a Docker-first LocalSend node with a responsive web interface. The
 - Automatic multi-interface IPv4/IPv6 UDP multicast discovery with optional advanced filtering
 - Automatic Ethernet-over-Wi-Fi preference when both adapters reach the same network, with runtime failover
 - Multi-file and clipboard-text sending to one or many LocalSend devices
+- Official-style link sharing with approval, automatic acceptance, optional PIN protection, QR codes, and repeatable browser downloads
 - Explicit accept/decline flow or automatic acceptance configurable from the Settings > Environment variables panel
 - Live send/receive byte progress plus persistent outgoing and receive history
 - Responsive Send / Receive / Settings navigation based on the official LocalSend information architecture
@@ -31,9 +32,13 @@ docker compose up -d
 
 Open `http://<server-ip>:52222`. Received files are written to `./data/downloads`.
 
+To share selected files with a browser, choose **Share via link** on the Send screen. The control UI remains at `http://<server-ip>:52222/` and the active browser download page is served from `http://<server-ip>:52222/share`, so no additional HTTP port is required.
+
+Link sharing follows LocalSend's single-session model: one file batch is active at a time, starting another share replaces it, and accepted browsers may download its files repeatedly while it remains active. Leaving or stopping the share invalidates the link and removes its staged files. Each browser address can be approved or declined, or requests can be accepted automatically; an optional PIN can be embedded in the QR code.
+
 ## Security boundary
 
-The web control API is intentionally unauthenticated, so expose port `52222` only on a trusted LAN. Do not publish it directly to the Internet; bind it to loopback or protect it with your network controls when the host is on an untrusted network. When auto-accept is enabled, any device that can reach the LocalSend receiver can save files without an approval prompt, subject to the configured upload limit.
+The web control API is intentionally unauthenticated, so expose port `52222` only on a trusted LAN. Do not publish it directly to the Internet; bind it to loopback or protect it with your network controls when the host is on an untrusted network. This boundary also applies to `/share`: use approval or a PIN when link access should be restricted. When auto-accept is enabled, any device that can reach the relevant receiver or active share can transfer files without an approval prompt, subject to the configured upload limit.
 
 The first start creates a persistent official-style random identity in `/data/device-identity.json`. To use a fixed name instead:
 
@@ -75,7 +80,7 @@ The Settings > Environment variables panel persists automatic acceptance, the Lo
 
 ## Current protocol boundaries
 
-Localsendy exposes only settings that the current service can enforce. Automatic acceptance, the LocalSend display name, the random-name language, and the save directory are supported. PIN validation, favorite-device trust rules, share-by-link, and configurable multicast groups are not implemented by the current service and are intentionally not shown as working controls.
+Localsendy exposes only settings that the current service can enforce. Automatic acceptance, the LocalSend display name, the random-name language, the save directory, and link-share access controls are supported. Favorite-device trust rules and configurable multicast groups are not implemented by the current service and are intentionally not shown as working controls.
 
 ## Local development
 
@@ -111,7 +116,7 @@ docker build -t localsendy:dev .
 
 ```text
 Browser (React/Vite)
-        │ /api/v1
+        │ /api/v1 and /share
         ▼
 Localsendy (Axum, :52222)
         ├── multicast discovery (UDP :53317)
@@ -125,7 +130,6 @@ See [docs/architecture.md](docs/architecture.md) and the persisted [design syste
 ## Roadmap
 
 - Saved manual targets for networks where multicast is unavailable
-- Share-by-link mode
 - Transfer cancellation
 - History retention controls
 - Additional official LocalSend locale coverage

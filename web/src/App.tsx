@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   ChevronRight,
   ClipboardPaste,
+  Copy,
   CircleAlert,
   Clock3,
   File,
@@ -16,12 +17,15 @@ import {
   Inbox,
   Languages,
   Laptop,
+  Link2,
   Monitor,
   Moon,
+  QrCode,
   RefreshCw,
   Send as SendIcon,
   Server,
   Settings as SettingsIcon,
+  Shield,
   ShieldCheck,
   Smartphone,
   Sun,
@@ -31,11 +35,13 @@ import {
 } from 'lucide-react';
 import {
   createStorageDirectory,
+  decideLinkShareRequest,
   decidePending,
   getDevices,
   getEnvironmentSettings,
   getHistory,
   getIncomingTransfers,
+  getLinkShare,
   getNetworkSettings,
   getPending,
   getStatus,
@@ -45,12 +51,17 @@ import {
   scanDevices,
   sendFiles,
   sendText,
+  startLinkShare,
+  stopLinkShare,
   listStorageDirectories,
   updateStorageSettings,
   updateNetworkSettings,
   updateEnvironmentSettings,
+  updateLinkShare,
 } from './api';
 import type { UploadProgress } from './api';
+import { ConfirmDialog } from './components/ConfirmDialog';
+import { LinkShareView } from './components/LinkShareView';
 import { detectLocale, messages } from './i18n';
 import { formatBytes, formatTime } from './format';
 import type {
@@ -58,6 +69,7 @@ import type {
   AliasLocale,
   EnvironmentSettings,
   IncomingTransfer,
+  LinkShare,
   Locale,
   NetworkInterfaceInfo,
   NetworkMode,
@@ -106,6 +118,10 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+  const [linkShare, setLinkShare] = useState<LinkShare | null>(null);
+  const [isLinkShareView, setIsLinkShareView] = useState(false);
+  const [isStartingLinkShare, setIsStartingLinkShare] = useState(false);
+  const [linkShareUploadProgress, setLinkShareUploadProgress] = useState<UploadProgress | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const copy = useMemo(() => messages(locale), [locale]);
 
@@ -261,7 +277,74 @@ export default function App() {
     }
   }
 
-  const nav = (id: Tab) => setActiveTab(id);
+  async function handleStartLinkShare() {
+    if (files.length === 0) return;
+    setIsStartingLinkShare(true);
+    setError(null);
+    setLinkShareUploadProgress({ loaded: 0, total: files.reduce((total, file) => total + file.size, 0) });
+    try {
+      const next = await startLinkShare(files, false, '', setLinkShareUploadProgress);
+      setLinkShare(next);
+      setIsLinkShareView(true);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : copy.error);
+    } finally {
+      setIsStartingLinkShare(false);
+      setLinkShareUploadProgress(null);
+    }
+  }
+
+  async function handleStopLinkShare() {
+    const shareId = linkShare?.shareId;
+    if (!shareId) {
+      setLinkShare(null);
+      setIsLinkShareView(false);
+      return;
+    }
+    try {
+      await stopLinkShare(shareId);
+      setLinkShare(null);
+      setIsLinkShareView(false);
+      setNotice(copy.linkShareStopped);
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : copy.error);
+    }
+  }
+
+  useEffect(() => {
+    if (!isLinkShareView) return undefined;
+    let cancelled = false;
+    const poll = async () => {
+      try {
+        const next = await getLinkShare();
+        if (!cancelled) {
+          setLinkShare(next.active ? next : null);
+          if (!next.active) setIsLinkShareView(false);
+        }
+      } catch (requestError) {
+        if (!cancelled) setError(requestError instanceof Error ? requestError.message : copy.error);
+      }
+    };
+    void poll();
+    const timer = window.setInterval(poll, 1000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [copy.error, isLinkShareView]);
+
+  useEffect(() => {
+    const shareId = linkShare?.shareId;
+    if (!isLinkShareView || !shareId) return undefined;
+    const stopOnExit = () => { void stopLinkShare(shareId, true).catch(() => undefined); };
+    window.addEventListener('pagehide', stopOnExit);
+    return () => window.removeEventListener('pagehide', stopOnExit);
+  }, [isLinkShareView, linkShare?.shareId]);
+
+  const nav = (id: Tab) => {
+    if (isLinkShareView && id !== 'send') void handleStopLinkShare();
+    setActiveTab(id);
+  };
 
   function toggleDevice(device: DeviceInfo) {
     const key = deviceKey(device);
@@ -295,7 +378,7 @@ export default function App() {
         </nav>
         <div className="sidebar-footer">
           <StatusPill status={status} copy={copy} />
-          <span className="version-label">v{status?.version ?? '0.2.1'}</span>
+          <span className="version-label">v{status?.version ?? '0.3.0'}</span>
         </div>
       </aside>
 
@@ -339,7 +422,8 @@ export default function App() {
           </div>
         ) : null}
 
-        {activeTab === 'send' ? (
+        {activeTab === 'send' && isLinkShareView && linkShare ? <LinkShareView copy={copy} share={linkShare} onShare={setLinkShare} onBack={handleStopLinkShare} onError={setError} onNotice={setNotice} /> : null}
+        {activeTab === 'send' && !isLinkShareView ? (
           <SendView
             copy={copy}
             devices={devices}
@@ -367,6 +451,9 @@ export default function App() {
             onClearFiles={() => setFiles([])}
             onRemoveFile={(index) => setFiles((current) => current.filter((_, currentIndex) => currentIndex !== index))}
             onSend={handleSend}
+            onLinkShare={handleStartLinkShare}
+            isStartingLinkShare={isStartingLinkShare}
+            linkShareUploadProgress={linkShareUploadProgress}
           />
         ) : null}
         {activeTab === 'receive' ? <ReceiveView copy={copy} status={status} pending={pending} history={history} incomingTransfers={incomingTransfers} onDecision={handlePending} /> : null}
@@ -426,6 +513,9 @@ function SendView(props: {
   onClearFiles: () => void;
   onRemoveFile: (index: number) => void;
   onSend: () => void;
+  onLinkShare: () => void;
+  isStartingLinkShare: boolean;
+  linkShareUploadProgress: UploadProgress | null;
 }) {
   const { copy } = props;
   const [clipboardError, setClipboardError] = useState<string | null>(null);
@@ -457,6 +547,15 @@ function SendView(props: {
       <div className="send-mode-control" role="tablist" aria-label={copy.sendContentType}>
         <button type="button" role="tab" aria-selected={props.sendMode === 'files'} className={props.sendMode === 'files' ? 'active' : ''} onClick={() => props.onSendMode('files')}><File size={17} aria-hidden="true" />{copy.files}</button>
         <button type="button" role="tab" aria-selected={props.sendMode === 'text'} className={props.sendMode === 'text' ? 'active' : ''} onClick={() => props.onSendMode('text')}><FileText size={17} aria-hidden="true" />{copy.clipboardText}</button>
+      </div>
+
+      <div className="link-share-entry">
+        <div><span className="link-share-entry-icon"><Link2 size={18} aria-hidden="true" /></span><span><strong>{copy.shareViaLink}</strong><small>{copy.shareViaLinkHint}</small></span></div>
+        <button className="secondary-button" type="button" disabled={props.files.length === 0 || props.sendMode !== 'files' || props.isStartingLinkShare} onClick={props.onLinkShare}>
+          {props.isStartingLinkShare ? <RefreshCw size={17} className="spin" aria-hidden="true" /> : <Link2 size={17} aria-hidden="true" />}
+          {props.isStartingLinkShare ? copy.startingLinkShare : copy.shareViaLink}
+        </button>
+        {props.linkShareUploadProgress ? <ProgressBar value={props.linkShareUploadProgress.loaded} total={props.linkShareUploadProgress.total} label={`${copy.uploadingToServer} ${formatBytes(props.linkShareUploadProgress.loaded)} / ${formatBytes(props.linkShareUploadProgress.total)}`} /> : null}
       </div>
 
       <div className="send-grid">
@@ -594,6 +693,7 @@ function SettingsView({ copy, locale, theme, status, onLocale, onTheme, onError,
   const [draftAliasLocale, setDraftAliasLocale] = useState<AliasLocale>('auto');
   const [isLoadingEnvironment, setIsLoadingEnvironment] = useState(true);
   const [isSavingEnvironment, setIsSavingEnvironment] = useState(false);
+  const [isAutoAcceptConfirmOpen, setIsAutoAcceptConfirmOpen] = useState(false);
 
   function resetNetworkDraft(next: NetworkSettings) {
     setNetworks(next);
@@ -724,8 +824,16 @@ function SettingsView({ copy, locale, theme, status, onLocale, onTheme, onError,
   }
 
   function toggleAutoAccept(enabled: boolean) {
-    if (enabled && !draftAutoAccept && !window.confirm(copy.autoAcceptConfirm)) return;
+    if (enabled && !draftAutoAccept) {
+      setIsAutoAcceptConfirmOpen(true);
+      return;
+    }
     setDraftAutoAccept(enabled);
+  }
+
+  function confirmAutoAccept() {
+    setDraftAutoAccept(true);
+    setIsAutoAcceptConfirmOpen(false);
   }
 
   async function applyEnvironment() {
@@ -851,7 +959,7 @@ function SettingsView({ copy, locale, theme, status, onLocale, onTheme, onError,
           </div>
         </div>
 
-        <div className="settings-section deployment-section"><div className="section-heading"><div><h2>{copy.deployment}</h2><p>Docker</p></div><Server size={21} className="section-icon" aria-hidden="true" /></div><p className="deployment-copy">{copy.deploymentHint}</p><div className="setting-row readonly-setting"><div className="setting-label"><ShieldCheck size={18} aria-hidden="true" /><span>{copy.version}</span></div><strong>v{status?.version ?? '0.2.1'}</strong></div></div>
+        <div className="settings-section deployment-section"><div className="section-heading"><div><h2>{copy.deployment}</h2><p>Docker</p></div><Server size={21} className="section-icon" aria-hidden="true" /></div><p className="deployment-copy">{copy.deploymentHint}</p><div className="setting-row readonly-setting"><div className="setting-label"><ShieldCheck size={18} aria-hidden="true" /><span>{copy.version}</span></div><strong>v{status?.version ?? '0.3.0'}</strong></div></div>
       </div>
       {storage ? <StorageDirectoryDialog
         open={isStoragePickerOpen}
@@ -865,6 +973,17 @@ function SettingsView({ copy, locale, theme, status, onLocale, onTheme, onError,
         }}
         onError={onError}
       /> : null}
+      <ConfirmDialog
+        open={isAutoAcceptConfirmOpen}
+        title={copy.autoAcceptDialogTitle}
+        description={copy.autoAcceptConfirm}
+        confirmLabel={copy.enableAutoAccept}
+        cancelLabel={copy.cancel}
+        icon={<CircleAlert size={20} aria-hidden="true" />}
+        tone="warning"
+        onCancel={() => setIsAutoAcceptConfirmOpen(false)}
+        onConfirm={confirmAutoAccept}
+      />
       <div className="settings-footnote"><ShieldCheck size={15} aria-hidden="true" /> {copy.privacyFootnote}</div>
     </section>
   );

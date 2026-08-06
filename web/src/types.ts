@@ -130,3 +130,29 @@ export interface SendResponse {
   filesSent: number;
   totalBytes: number;
 }
+
+export interface LinkShareFile {
+  id: string;
+  name: string;
+  size: number;
+}
+
+export interface LinkShareRequest {
+  sessionId: string;
+  ip: string;
+  userAgent?: string;
+  status: 'pending' | 'accepted';
+  createdAt: string;
+}
+
+export interface LinkShare {
+  active: boolean;
+  shareId?: string;
+  urls: string[];
+  files: LinkShareFile[];
+  totalBytes: number;
+  autoAccept: boolean;
+  pin?: string;
+  requests: LinkShareRequest[];
+  createdAt?: string;
+}

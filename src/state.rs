@@ -18,6 +18,7 @@ use tokio::sync::{RwLock as AsyncRwLock, Semaphore, mpsc};
 use uuid::Uuid;
 
 use crate::config::Config;
+use crate::link_share::LinkShareStore;
 use crate::network::{DiscoveryCommand, NetworkPreferences};
 use localsendy_storage::{Database, InstanceKey, TransferRecord};
 
@@ -43,6 +44,7 @@ pub struct AppState {
     pub receiver_destination: Arc<AsyncRwLock<PathBuf>>,
     pub scan_tx: mpsc::Sender<DiscoveryCommand>,
     pub network_preferences: Arc<RwLock<NetworkPreferences>>,
+    pub link_share: LinkShareStore,
     pub started_at: Instant,
 }
 

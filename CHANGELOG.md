@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.3.0 - 2026-08-06
+
+- Add official-style link sharing for selected files on the existing web port at `/share`.
+- Keep one active share at a time, allow repeated downloads while it is active, and clean staged files when it is replaced or stopped.
+- Add per-browser approval, decline, automatic acceptance, PIN protection, and PIN attempt limiting.
+- Add share management with responsive request, file, QR code, and access-control views in all supported locales.
+- Reuse LocalSend's official browser download page and session semantics while keeping the normal LocalSend HTTPS receiver running.
+
 ## v0.2.1 - 2026-08-06
 
 - Add a Settings > Environment variables panel for runtime automatic acceptance.

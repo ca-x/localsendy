@@ -11,6 +11,7 @@ import type {
   IncomingTransfer,
   SendResponse,
   EnvironmentSettings,
+  LinkShare,
 } from './types';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -134,3 +135,31 @@ export const sendText = (targets: DeviceInfo[], text: string, pin?: string) =>
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ targets, text, pin }),
   });
+
+export const getLinkShare = () => request<LinkShare>('/share');
+
+export function startLinkShare(
+  files: File[],
+  autoAccept: boolean,
+  pin: string,
+  onProgress: (progress: UploadProgress) => void,
+) {
+  const form = new FormData();
+  form.append('autoAccept', String(autoAccept));
+  if (pin) form.append('pin', pin);
+  files.forEach((file) => form.append('files', file, file.name));
+  return uploadMultipart<LinkShare>('/share', form, onProgress);
+}
+
+export const updateLinkShare = (autoAccept: boolean, pin: string) =>
+  request<LinkShare>('/share', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ autoAccept, pin }),
+  });
+
+export const stopLinkShare = (shareId: string, keepalive = false) =>
+  request<void>(`/share?shareId=${encodeURIComponent(shareId)}`, { method: 'DELETE', keepalive });
+
+export const decideLinkShareRequest = (sessionId: string, decision: 'accept' | 'reject') =>
+  request<void>(`/share/requests/${encodeURIComponent(sessionId)}/${decision}`, { method: 'POST' });
