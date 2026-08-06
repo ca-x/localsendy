@@ -327,7 +327,7 @@ const ALIAS_FRUITS_ZH_TW: &[&str] = &[
     "番茄",
 ];
 
-fn resolve_alias(
+pub(crate) fn resolve_alias(
     data_dir: &std::path::Path,
     alias: Option<String>,
     prefix: String,
@@ -431,14 +431,39 @@ fn parse_alias_locale(value: Option<String>, system_locale: Option<String>) -> R
         return Ok(locale_from_tag(system_locale.as_deref().unwrap_or("en")));
     }
     let locale = locale_from_tag(requested);
-    if matches!(
-        normalize_locale_tag(requested).as_str(),
-        "en" | "zh-cn" | "zh-hans" | "zh-tw" | "zh-hk" | "zh-mo" | "zh-hant"
-    ) {
+    let normalized = normalize_locale_tag(requested);
+    if normalized == "en"
+        || normalized == "zh"
+        || normalized == "zh-cn"
+        || normalized == "zh-hans"
+        || normalized.starts_with("zh-hans-")
+        || normalized == "zh-tw"
+        || normalized == "zh-hk"
+        || normalized == "zh-mo"
+        || normalized == "zh-hant"
+        || normalized.starts_with("zh-hant-")
+    {
         Ok(locale)
     } else {
         bail!("LOCALSENDY_ALIAS_LOCALE must be auto, en, zh-CN, or zh-TW")
     }
+}
+
+pub(crate) fn normalize_alias_locale(value: &str) -> Result<String> {
+    let value = value.trim();
+    if value.eq_ignore_ascii_case("auto") {
+        return Ok("auto".to_owned());
+    }
+    parse_alias_locale(Some(value.to_owned()), None)?;
+    let normalized = normalize_locale_tag(value);
+    Ok(match normalized.as_str() {
+        "en" => "en".to_owned(),
+        "zh-tw" | "zh-hk" | "zh-mo" | "zh-hant" => "zh-TW".to_owned(),
+        "zh-cn" | "zh-hans" | "zh" => "zh-CN".to_owned(),
+        _ if normalized.starts_with("zh-hans-") => "zh-CN".to_owned(),
+        _ if normalized.starts_with("zh-hant-") => "zh-TW".to_owned(),
+        _ => "en".to_owned(),
+    })
 }
 
 fn locale_from_tag(value: &str) -> AliasLocale {
@@ -494,7 +519,12 @@ fn optional_text_env(key: &str) -> Result<Option<String>> {
         .transpose()
 }
 
-fn validate_text(key: &str, value: String, max_chars: usize, allow_empty: bool) -> Result<String> {
+pub(crate) fn validate_text(
+    key: &str,
+    value: String,
+    max_chars: usize,
+    allow_empty: bool,
+) -> Result<String> {
     let value = value.trim().to_owned();
     if !allow_empty && value.is_empty() {
         bail!("{key} cannot be empty");
@@ -564,8 +594,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        AliasLocale, DeviceIdentity, localized_alias, parse_alias_locale, parse_bool_env,
-        parse_device_type, parse_network_selection, resolve_alias,
+        AliasLocale, DeviceIdentity, localized_alias, normalize_alias_locale, parse_alias_locale,
+        parse_bool_env, parse_device_type, parse_network_selection, resolve_alias,
     };
     use crate::network::NetworkMode;
 
@@ -601,6 +631,14 @@ mod tests {
             AliasLocale::English
         );
         assert!(parse_alias_locale(Some("fr".to_owned()), None).is_err());
+    }
+
+    #[test]
+    fn normalizes_alias_locale_for_settings_storage() {
+        assert_eq!(normalize_alias_locale("AUTO").unwrap(), "auto");
+        assert_eq!(normalize_alias_locale("zh_cn").unwrap(), "zh-CN");
+        assert_eq!(normalize_alias_locale("zh-TW").unwrap(), "zh-TW");
+        assert!(normalize_alias_locale("fr").is_err());
     }
 
     #[test]

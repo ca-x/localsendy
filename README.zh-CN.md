@@ -13,7 +13,7 @@ Localsendy 是一个面向 Docker 部署的 LocalSend 节点，提供响应式 W
 - 自动监听多网卡的 IPv4/IPv6 UDP 多播发现，并支持高级接口过滤与 Web 端手动扫描
 - 有线与 Wi-Fi 连接同一网络时自动优先有线，断开后运行时切换到 Wi-Fi
 - 向一个或多个 LocalSend 设备发送多个文件或剪贴板文本
-- 手动接受/拒绝，或通过环境变量在启动时启用自动接受
+- 手动接受/拒绝，或在“设置 > 环境变量”中配置自动接受
 - 实时显示发送与接收字节进度，并持久化发送和接收历史
 - 参考官方 LocalSend 的“发送 / 接收 / 设置”信息架构
 - 英文、简体中文、繁体中文基础多语言能力
@@ -30,6 +30,10 @@ docker compose up -d
 ```
 
 访问 `http://<服务器IP>:52222`，收到的文件保存在 `./data/downloads`。
+
+## 安全边界
+
+Web 控制 API 有意不提供身份认证，因此端口 `52222` 只能暴露在可信局域网中。请勿直接发布到互联网；若主机处于不可信网络，请改为绑定到回环地址，或使用网络侧访问控制进行保护。启用自动接受后，任何能访问 LocalSend 接收器的设备都可以免确认保存文件，但仍受配置的上传大小上限限制。
 
 首次启动会在 `/data/device-identity.json` 生成并持久化官方风格随机身份。如需使用固定名称：
 
@@ -61,17 +65,17 @@ Linux 使用 host 网络时，Localsendy 会自动监听宿主机上的全部可
 | `LOCALSENDY_DATA_DIR` | `/data` | 持久化数据根目录 |
 | `LOCALSENDY_DOWNLOAD_DIR` | `/data/downloads` | 接收文件保存目录，会覆盖数据根目录下的默认路径 |
 | `LOCALSENDY_TEMP_DIR` | `/data/tmp` | 运行时临时数据目录 |
-| `LOCALSENDY_AUTO_ACCEPT` | `false` | 自动接受传入请求；在服务启动时读取 |
+| `LOCALSENDY_AUTO_ACCEPT` | `false` | 自动接受传入请求的启动默认值；“设置”界面可以覆盖并保存此选择 |
 | `LOCALSENDY_DISCOVERY_INTERVAL_SECONDS` | `30` | 局域网广播间隔，最小 5 秒 |
 | `LOCALSENDY_NETWORK_INTERFACES` | `all` | 初始回退值：`all`、`*` 或接口列表；界面持久化配置优先 |
 | `LOCALSENDY_MAX_UPLOAD_BYTES` | `10737418240` | 单次浏览器发送请求的总大小上限 |
 | `RUST_LOG` | `localsendy=info,tower_http=info` | Rust 日志过滤器 |
 
-别名、设备类型、设备型号和端口属于启动身份。修改环境变量并重启容器后生效，与官方 LocalSend 的服务重启行为一致。
+“设置 > 环境变量”会把自动接受、LocalSend 网络显示名称和随机名称语言保存到 `/data/localsendy.sqlite3`。界面中的值会覆盖对应的环境变量默认值，并立即生效；设备类型、设备型号和端口仍属于启动身份，修改它们的环境变量后需要重启容器。
 
 ## 当前协议边界
 
-Localsendy 只展示当前服务能够真实执行的设置。自动接受通过环境变量配置，保存目录可在 Web 端选择；PIN 校验、收藏设备信任规则、链接分享和自定义多播组目前尚未实现，因此不会提供看似可用但实际无效的开关。
+Localsendy 只展示当前服务能够真实执行的设置。自动接受、LocalSend 网络名称、随机名称语言和保存目录均可配置；PIN 校验、收藏设备信任规则、链接分享和自定义多播组目前尚未实现，因此不会提供看似可用但实际无效的开关。
 
 ## 本地开发与检查
 

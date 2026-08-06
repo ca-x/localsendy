@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { scanDevices, sendFiles, sendText } from './api';
+import { scanDevices, sendFiles, sendText, updateEnvironmentSettings } from './api';
 import type { DeviceInfo } from './types';
 
 const target: DeviceInfo = {
@@ -23,6 +23,30 @@ describe('API responses', () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(new Response(null, { status: 202 })));
 
     await expect(scanDevices()).resolves.toBeUndefined();
+  });
+
+  it('updates environment-backed settings through the settings endpoint', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({
+      autoAccept: true,
+      alias: '聪明的覆盆子',
+      aliasLocale: 'zh-CN',
+    }), { status: 200 }));
+    vi.stubGlobal('fetch', fetchMock);
+
+    await expect(updateEnvironmentSettings({
+      autoAccept: true,
+      alias: '',
+      aliasLocale: 'zh-CN',
+    })).resolves.toMatchObject({ aliasLocale: 'zh-CN' });
+
+    const [path, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(path).toBe('/api/v1/settings');
+    expect(init.method).toBe('PUT');
+    expect(JSON.parse(String(init.body))).toEqual({
+      autoAccept: true,
+      alias: '',
+      aliasLocale: 'zh-CN',
+    });
   });
 
   it('sends clipboard text to every selected device', async () => {

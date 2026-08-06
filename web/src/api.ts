@@ -10,6 +10,7 @@ import type {
   DirectoryListing,
   IncomingTransfer,
   SendResponse,
+  EnvironmentSettings,
 } from './types';
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -62,6 +63,13 @@ function uploadMultipart<T>(path: string, body: FormData, onProgress: (progress:
 }
 
 export const getStatus = () => request<StatusResponse>('/status');
+export const getEnvironmentSettings = () => request<EnvironmentSettings>('/settings');
+export const updateEnvironmentSettings = (settings: Partial<EnvironmentSettings>) =>
+  request<EnvironmentSettings>('/settings', {
+    method: 'PUT',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(settings),
+  });
 export const getDevices = () => request<DeviceInfo[]>('/devices');
 export const scanDevices = () => request<void>('/devices/scan', { method: 'POST' });
 export const getNetworkSettings = () => request<NetworkSettings>('/networks');

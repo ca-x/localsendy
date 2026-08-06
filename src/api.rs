@@ -34,6 +34,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 use uuid::Uuid;
 
+use crate::config::{normalize_alias_locale, resolve_alias, validate_text};
 use crate::network::{
     DEFAULT_MULTICAST_ADDRESS, DEFAULT_MULTICAST_GROUP_V6, DiscoveryCommand, NetworkMode,
     NetworkPreferences, NetworkSelection, NetworkSettings, network_settings,
@@ -58,6 +59,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
         .route("/status", get(status))
+        .route("/settings", get(settings).put(update_settings))
         .route("/devices", get(devices))
         .route("/devices/scan", post(scan))
         .route("/devices/probe", post(probe_device))
@@ -111,6 +113,11 @@ struct StatusResponse {
 
 async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
     let devices = state.active_devices();
+    let local_device = state
+        .local_device
+        .read()
+        .expect("local device lock should not be poisoned")
+        .clone();
     let data_directory = state
         .receiver_destination
         .read()
@@ -119,21 +126,173 @@ async fn status(State(state): State<AppState>) -> Json<StatusResponse> {
         .to_string();
     Json(StatusResponse {
         version: env!("CARGO_PKG_VERSION"),
-        alias: state.config.alias.clone(),
-        device_type: state.local_device.device_type,
-        device_model: state.local_device.device_model.clone(),
+        alias: local_device.alias,
+        device_type: local_device.device_type,
+        device_model: local_device.device_model,
         web_address: state.config.web_bind.to_string(),
         localsend_port: state.config.localsend_port,
-        protocol: state.local_device.protocol.to_string(),
+        protocol: local_device.protocol.to_string(),
         multicast_ipv4: DEFAULT_MULTICAST_ADDRESS.to_owned(),
         multicast_ipv6: DEFAULT_MULTICAST_GROUP_V6.to_string(),
         data_directory,
-        auto_accept: state.config.auto_accept,
+        auto_accept: state.auto_accept.load(Ordering::Relaxed),
         discovery_interval_seconds: state.config.discovery_interval_seconds,
         max_upload_bytes: state.config.max_upload_bytes,
         uptime_seconds: state.started_at.elapsed().as_secs(),
         nearby_devices: devices.len(),
     })
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct EnvironmentSettingsResponse {
+    auto_accept: bool,
+    alias: String,
+    alias_locale: String,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateSettingsRequest {
+    auto_accept: Option<bool>,
+    alias: Option<String>,
+    alias_locale: Option<String>,
+}
+
+async fn settings(State(state): State<AppState>) -> Json<EnvironmentSettingsResponse> {
+    let alias = state
+        .local_device
+        .read()
+        .expect("local device lock should not be poisoned")
+        .alias
+        .clone();
+    let alias_locale = state
+        .alias_locale
+        .read()
+        .expect("alias locale lock should not be poisoned")
+        .clone();
+    Json(EnvironmentSettingsResponse {
+        auto_accept: state.auto_accept.load(Ordering::Relaxed),
+        alias,
+        alias_locale,
+    })
+}
+
+async fn update_settings(
+    State(state): State<AppState>,
+    Json(request): Json<UpdateSettingsRequest>,
+) -> Result<Json<EnvironmentSettingsResponse>, ApiError> {
+    let current_alias = state
+        .local_device
+        .read()
+        .expect("local device lock should not be poisoned")
+        .alias
+        .clone();
+    let current_locale = state
+        .alias_locale
+        .read()
+        .expect("alias locale lock should not be poisoned")
+        .clone();
+
+    let requested_locale = request
+        .alias_locale
+        .as_deref()
+        .map(str::trim)
+        .filter(|locale| !locale.is_empty())
+        .unwrap_or(current_locale.as_str())
+        .to_owned();
+    let alias_locale = normalize_alias_locale(&requested_locale).map_err(ApiError::bad_request)?;
+    let alias = match request.alias {
+        Some(value) if value.trim().is_empty() => resolve_alias(
+            &state.config.data_dir,
+            None,
+            String::new(),
+            Some(alias_locale.clone()),
+            std::env::var("LC_ALL")
+                .ok()
+                .or_else(|| std::env::var("LANG").ok()),
+        )
+        .map_err(ApiError::bad_request)?,
+        Some(value) => {
+            validate_text("LOCALSENDY_ALIAS", value, 64, false).map_err(ApiError::bad_request)?
+        }
+        None => current_alias,
+    };
+
+    if let Some(auto_accept) = request.auto_accept {
+        state
+            .database
+            .store_setting(
+                SettingScope::Instance(&state.instance_key),
+                "auto_accept",
+                &auto_accept,
+            )
+            .map_err(ApiError::internal)?;
+        state.auto_accept.store(auto_accept, Ordering::Relaxed);
+    }
+
+    let alias_changed = alias
+        != state
+            .local_device
+            .read()
+            .expect("local device lock should not be poisoned")
+            .alias;
+    if alias_changed {
+        state
+            .database
+            .update_instance_alias(&state.instance_key, &alias)
+            .map_err(ApiError::internal)?;
+        {
+            let mut local = state
+                .local_device
+                .write()
+                .expect("local device lock should not be poisoned");
+            local.alias = alias.clone();
+        }
+        {
+            let mut devices = state
+                .discovery_devices
+                .write()
+                .expect("discovery devices lock should not be poisoned");
+            for device in devices.iter_mut() {
+                if device.fingerprint
+                    == state
+                        .local_device
+                        .read()
+                        .expect("local device lock should not be poisoned")
+                        .fingerprint
+                {
+                    device.alias = alias.clone();
+                }
+            }
+        }
+        state.receiver_server.update_alias(alias.clone()).await;
+        // Do not make peers wait for the periodic announcement after a user
+        // changes the display name. The discovery task snapshots this shared
+        // device record when it handles the command.
+        queue_discovery_scan(&state.scan_tx)?;
+    }
+
+    if request.alias_locale.is_some() || alias_changed {
+        state
+            .database
+            .store_setting(
+                SettingScope::Instance(&state.instance_key),
+                "alias_locale",
+                &alias_locale,
+            )
+            .map_err(ApiError::internal)?;
+        *state
+            .alias_locale
+            .write()
+            .expect("alias locale lock should not be poisoned") = alias_locale.clone();
+    }
+
+    Ok(Json(EnvironmentSettingsResponse {
+        auto_accept: state.auto_accept.load(Ordering::Relaxed),
+        alias,
+        alias_locale,
+    }))
 }
 
 #[derive(Serialize)]
@@ -1199,6 +1358,11 @@ async fn perform_send(
     let protocol = target.protocol.into();
     let expected_fingerprint =
         (target.protocol == Protocol::Https).then(|| target.fingerprint.clone());
+    let local_device = state
+        .local_device
+        .read()
+        .expect("local device lock should not be poisoned")
+        .clone();
     let client = LsHttpClientV2::try_new(
         &state.identity.material.private_key_pem,
         &state.identity.material.certificate_pem,
@@ -1208,12 +1372,7 @@ async fn perform_send(
     .map_err(|error| ApiError::internal(error.to_string()))?;
     let registration = tokio::time::timeout(
         REGISTER_TIMEOUT,
-        client.register(
-            protocol,
-            host,
-            target.port,
-            state.local_device.to_register(),
-        ),
+        client.register(protocol, host, target.port, local_device.to_register()),
     )
     .await
     .map_err(|_| ApiError::bad_gateway("Target registration timed out"))?
@@ -1235,7 +1394,7 @@ async fn perform_send(
             target.port,
             registration.public_key.clone(),
             PrepareUploadRequestDtoV2 {
-                info: state.local_device.to_register(),
+                info: local_device.to_register(),
                 files,
             },
             pin,

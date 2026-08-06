@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.1 - 2026-08-06
+
+- Add a Settings > Environment variables panel for runtime automatic acceptance.
+- Allow editing the LocalSend display name and regenerating stable multilingual random names.
+- Apply display-name and automatic-acceptance changes immediately, persist them in SQLite, and rebroadcast the updated identity.
+- Confirm the trusted-network implication before enabling automatic acceptance and document the unauthenticated control API boundary.
+- Polish the new settings form for keyboard access, mobile touch targets, loading feedback, and all supported locales.
+
 ## v0.2.0 - 2026-08-06
 
 - Send files or clipboard text to multiple LocalSend devices in one operation.

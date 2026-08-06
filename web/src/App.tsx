@@ -33,6 +33,7 @@ import {
   createStorageDirectory,
   decidePending,
   getDevices,
+  getEnvironmentSettings,
   getHistory,
   getIncomingTransfers,
   getNetworkSettings,
@@ -47,12 +48,15 @@ import {
   listStorageDirectories,
   updateStorageSettings,
   updateNetworkSettings,
+  updateEnvironmentSettings,
 } from './api';
 import type { UploadProgress } from './api';
 import { detectLocale, messages } from './i18n';
 import { formatBytes, formatTime } from './format';
 import type {
   DeviceInfo,
+  AliasLocale,
+  EnvironmentSettings,
   IncomingTransfer,
   Locale,
   NetworkInterfaceInfo,
@@ -291,7 +295,7 @@ export default function App() {
         </nav>
         <div className="sidebar-footer">
           <StatusPill status={status} copy={copy} />
-          <span className="version-label">v{status?.version ?? '0.2.0'}</span>
+          <span className="version-label">v{status?.version ?? '0.2.1'}</span>
         </div>
       </aside>
 
@@ -584,6 +588,12 @@ function SettingsView({ copy, locale, theme, status, onLocale, onTheme, onError,
   const [storage, setStorage] = useState<StorageSettings | null>(null);
   const [isLoadingStorage, setIsLoadingStorage] = useState(true);
   const [isStoragePickerOpen, setIsStoragePickerOpen] = useState(false);
+  const [environment, setEnvironment] = useState<EnvironmentSettings | null>(null);
+  const [draftAutoAccept, setDraftAutoAccept] = useState(false);
+  const [draftAlias, setDraftAlias] = useState('');
+  const [draftAliasLocale, setDraftAliasLocale] = useState<AliasLocale>('auto');
+  const [isLoadingEnvironment, setIsLoadingEnvironment] = useState(true);
+  const [isSavingEnvironment, setIsSavingEnvironment] = useState(false);
 
   function resetNetworkDraft(next: NetworkSettings) {
     setNetworks(next);
@@ -604,6 +614,26 @@ function SettingsView({ copy, locale, theme, status, onLocale, onTheme, onError,
       })
       .finally(() => {
         if (active) setIsLoadingNetworks(false);
+      });
+    return () => { active = false; };
+  }, [copy.error, onError]);
+
+  useEffect(() => {
+    let active = true;
+    setIsLoadingEnvironment(true);
+    getEnvironmentSettings()
+      .then((next) => {
+        if (!active) return;
+        setEnvironment(next);
+        setDraftAutoAccept(next.autoAccept);
+        setDraftAlias(next.alias);
+        setDraftAliasLocale(next.aliasLocale);
+      })
+      .catch((requestError) => {
+        if (active) onError(requestError instanceof Error ? requestError.message : copy.error);
+      })
+      .finally(() => {
+        if (active) setIsLoadingEnvironment(false);
       });
     return () => { active = false; };
   }, [copy.error, onError]);
@@ -682,6 +712,44 @@ function SettingsView({ copy, locale, theme, status, onLocale, onTheme, onError,
     }
   }
 
+  const environmentChanged = Boolean(environment && (
+    draftAutoAccept !== environment.autoAccept
+    || draftAlias.trim() !== environment.alias
+    || draftAliasLocale !== environment.aliasLocale
+  ));
+
+  function generateRandomAlias() {
+    setDraftAlias('');
+    setDraftAliasLocale(locale === 'zh-CN' || locale === 'zh-TW' ? locale : 'en');
+  }
+
+  function toggleAutoAccept(enabled: boolean) {
+    if (enabled && !draftAutoAccept && !window.confirm(copy.autoAcceptConfirm)) return;
+    setDraftAutoAccept(enabled);
+  }
+
+  async function applyEnvironment() {
+    if (!environmentChanged) return;
+    setIsSavingEnvironment(true);
+    onError(null);
+    try {
+      const next = await updateEnvironmentSettings({
+        autoAccept: draftAutoAccept,
+        alias: draftAlias,
+        aliasLocale: draftAliasLocale,
+      });
+      setEnvironment(next);
+      setDraftAutoAccept(next.autoAccept);
+      setDraftAlias(next.alias);
+      setDraftAliasLocale(next.aliasLocale);
+      onNotice(copy.environmentApplied);
+    } catch (requestError) {
+      onError(requestError instanceof Error ? requestError.message : copy.error);
+    } finally {
+      setIsSavingEnvironment(false);
+    }
+  }
+
   const deviceNetworks = networks?.interfaces.filter((network) => network.kind !== 'bridge' && network.kind !== 'virtual') ?? [];
   const virtualNetworks = networks?.interfaces.filter((network) => network.kind === 'bridge' || network.kind === 'virtual') ?? [];
   const deviceTypeLabel = status?.deviceType
@@ -713,10 +781,22 @@ function SettingsView({ copy, locale, theme, status, onLocale, onTheme, onError,
             </button>
           </div>
           <p className="storage-root-hint">{copy.storageRoot}: <code>{storage?.root ?? copy.loading}</code></p>
-          <div className="setting-row readonly-setting">
-            <div className="setting-label"><Inbox size={18} aria-hidden="true" /><span><strong>{copy.autoAccept}</strong><small>{copy.autoAcceptHint}</small></span></div>
-            <strong>{status?.autoAccept ? copy.enabled : copy.disabled}</strong>
-          </div>
+        </div>
+
+        <div className="settings-section environment-settings-section">
+          <div className="section-heading"><div><h2>{copy.environmentVariables}</h2><p>{copy.environmentVariablesHint}</p></div><Server size={21} className="section-icon" aria-hidden="true" /></div>
+          {isLoadingEnvironment ? <div className="network-loading"><RefreshCw size={18} className="spin" aria-hidden="true" /><span>{copy.loading}</span></div> : <>
+            <label className="network-mode-row environment-toggle-row">
+              <span className="network-mode-copy"><strong>{copy.autoAccept}</strong><small>{copy.autoAcceptHint}</small></span>
+              <span className="network-mode-meta"><span>{draftAutoAccept ? copy.enabled : copy.disabled}</span><input className="sr-only" type="checkbox" checked={draftAutoAccept} aria-describedby="auto-accept-warning" onChange={(event) => toggleAutoAccept(event.target.checked)} disabled={isSavingEnvironment} /><span className="switch-track" aria-hidden="true"><span className="switch-thumb" /></span></span>
+            </label>
+            <p id="auto-accept-warning" className="environment-security-note"><CircleAlert size={16} aria-hidden="true" /><span>{copy.autoAcceptWarning}</span></p>
+            <div className="environment-form">
+              <label className="environment-field" htmlFor="environment-alias"><span>{copy.alias}</span><input id="environment-alias" value={draftAlias} onChange={(event) => setDraftAlias(event.target.value)} placeholder={copy.aliasPlaceholder} maxLength={64} disabled={isSavingEnvironment} /></label>
+              <div className="environment-field"><label htmlFor="environment-alias-locale">{copy.aliasLocale}</label><div className="environment-alias-actions"><select id="environment-alias-locale" className="setting-select" value={draftAliasLocale} onChange={(event) => setDraftAliasLocale(event.target.value as AliasLocale)} disabled={isSavingEnvironment}><option value="auto">{copy.aliasLocaleAuto}</option><option value="en">English</option><option value="zh-CN">简体中文</option><option value="zh-TW">繁體中文</option></select><button className="secondary-button" type="button" onClick={generateRandomAlias} disabled={isSavingEnvironment}>{copy.randomAlias}</button></div></div>
+            </div>
+            <div className="environment-actions"><span className="network-runtime-note"><ShieldCheck size={15} aria-hidden="true" />{copy.environmentVariablesHint}</span><button className="primary-button" type="button" disabled={!environmentChanged || isSavingEnvironment} onClick={applyEnvironment}>{isSavingEnvironment ? <RefreshCw size={17} className="spin" aria-hidden="true" /> : <Check size={17} aria-hidden="true" />}{isSavingEnvironment ? copy.saving : copy.saveChanges}</button></div>
+          </>}
         </div>
 
         <div className="settings-section advanced-settings-section deployment-section">
@@ -771,7 +851,7 @@ function SettingsView({ copy, locale, theme, status, onLocale, onTheme, onError,
           </div>
         </div>
 
-        <div className="settings-section deployment-section"><div className="section-heading"><div><h2>{copy.deployment}</h2><p>Docker</p></div><Server size={21} className="section-icon" aria-hidden="true" /></div><p className="deployment-copy">{copy.deploymentHint}</p><div className="setting-row readonly-setting"><div className="setting-label"><ShieldCheck size={18} aria-hidden="true" /><span>{copy.version}</span></div><strong>v{status?.version ?? '0.2.0'}</strong></div></div>
+        <div className="settings-section deployment-section"><div className="section-heading"><div><h2>{copy.deployment}</h2><p>Docker</p></div><Server size={21} className="section-icon" aria-hidden="true" /></div><p className="deployment-copy">{copy.deploymentHint}</p><div className="setting-row readonly-setting"><div className="setting-label"><ShieldCheck size={18} aria-hidden="true" /><span>{copy.version}</span></div><strong>v{status?.version ?? '0.2.1'}</strong></div></div>
       </div>
       {storage ? <StorageDirectoryDialog
         open={isStoragePickerOpen}

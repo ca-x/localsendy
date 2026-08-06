@@ -12,7 +12,9 @@ Localsendy keeps the browser outside the LocalSend protocol boundary. Rust owns 
 
 The receiver creates an ephemeral self-signed certificate at startup and advertises its SHA-256 fingerprint as required by the LocalSend protocol.
 
-Device identity is resolved at startup. Unless `LOCALSENDY_ALIAS` fixes the full alias, `/data/device-identity.json` stores language-neutral adjective and fruit indexes. This preserves one random identity while allowing `LOCALSENDY_ALIAS_LOCALE` to render it in English, Simplified Chinese, or Traditional Chinese. Alias, type, model, and protocol port changes require a service restart.
+Device identity is resolved at startup. Unless `LOCALSENDY_ALIAS` fixes the full alias, `/data/device-identity.json` stores language-neutral adjective and fruit indexes. This preserves one random identity while allowing `LOCALSENDY_ALIAS_LOCALE` or the Settings > Environment variables panel to render it in English, Simplified Chinese, or Traditional Chinese. The panel persists the display alias and random-name language, immediately announces a display-name change, and updates LocalSend HTTP identity responses without restarting the service. Type, model, and protocol port changes still require a service restart.
+
+The browser control API deliberately assumes a trusted LAN and does not authenticate users. Operators must not expose port `52222` to untrusted networks. Enabling auto-accept also trusts every LocalSend peer that can reach the receiver to upload without a per-transfer confirmation.
 
 ## Data flow
 

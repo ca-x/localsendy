@@ -7,6 +7,7 @@ mod web;
 
 use std::{
     collections::HashMap,
+    sync::atomic::AtomicBool,
     sync::{Arc, RwLock},
     time::Instant,
 };
@@ -48,6 +49,16 @@ async fn main() -> Result<()> {
     })?;
     config.alias = instance.alias.clone();
     config.localsend_port = instance.port;
+    if let Some(auto_accept) =
+        database.load_setting::<bool>(SettingScope::Instance(&instance_key), "auto_accept")?
+    {
+        config.auto_accept = auto_accept;
+    }
+    let alias_locale = database
+        .load_setting::<String>(SettingScope::Instance(&instance_key), "alias_locale")?
+        .or_else(|| std::env::var("LOCALSENDY_ALIAS_LOCALE").ok())
+        .unwrap_or_else(|| "auto".to_owned());
+    let alias_locale = config::normalize_alias_locale(&alias_locale)?;
     tokio::fs::create_dir_all(config.downloads_dir())
         .await
         .context("failed to create downloads directory")?;
@@ -84,6 +95,14 @@ async fn main() -> Result<()> {
         download: false,
         ip: None,
     };
+    let local_device = Arc::new(RwLock::new(local_device));
+    let discovery_devices_info = Arc::new(RwLock::new(vec![
+        local_device
+            .read()
+            .expect("local device lock should not be poisoned")
+            .clone(),
+    ]));
+    let auto_accept = Arc::new(AtomicBool::new(config.auto_accept));
 
     let devices = Arc::new(RwLock::new(HashMap::<String, SeenDevice>::new()));
     let pending_transfer = Arc::new(AsyncRwLock::new(None::<PendingTransfer>));
@@ -134,29 +153,34 @@ async fn main() -> Result<()> {
             }
         }
     });
+    let receiver_device = local_device
+        .read()
+        .expect("local device lock should not be poisoned")
+        .clone();
     let receiver = start_receiver(
         &identity,
-        local_device.clone(),
+        receiver_device,
         config.max_upload_bytes,
         ReceiverState {
             pending_transfer: pending_transfer.clone(),
             received_files: received_files.clone(),
             incoming_transfers: incoming_transfers.clone(),
             destination: receiver_destination.clone(),
-            auto_accept: config.auto_accept,
+            auto_accept: auto_accept.clone(),
             completed_tx: Some(received_tx),
         },
     )
     .await
     .context("failed to start official LocalSend Rust server")?;
+    let receiver_server = receiver.server_handle();
 
     let network_preferences = Arc::new(RwLock::new(NetworkPreferences::load(
         &config.network_config_path(),
         config.network_selection.clone(),
     )?));
     let (scan_tx, scan_rx) = mpsc::channel::<DiscoveryCommand>(4);
-    let discovery_devices_info = Arc::new(RwLock::new(vec![local_device.clone()]));
     let discovery_devices = devices.clone();
+    let discovery_devices_state = discovery_devices_info.clone();
     let discovery_preferences = network_preferences.clone();
     let discovery_interval = config.discovery_interval_seconds;
     tokio::spawn(async move {
@@ -179,6 +203,10 @@ async fn main() -> Result<()> {
         instance_key,
         identity,
         local_device,
+        discovery_devices: discovery_devices_state,
+        receiver_server,
+        auto_accept,
+        alias_locale: Arc::new(RwLock::new(alias_locale)),
         devices,
         pending_transfer,
         received_files,

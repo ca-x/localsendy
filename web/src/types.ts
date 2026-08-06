@@ -1,5 +1,6 @@
 export type Tab = 'send' | 'receive' | 'settings';
 export type Locale = 'en' | 'zh-CN' | 'zh-TW';
+export type AliasLocale = 'auto' | 'en' | 'zh-CN' | 'zh-TW';
 
 export interface DeviceInfo {
   alias: string;
@@ -31,6 +32,12 @@ export interface StatusResponse {
   maxUploadBytes: number;
   uptimeSeconds: number;
   nearbyDevices: number;
+}
+
+export interface EnvironmentSettings {
+  autoAccept: boolean;
+  alias: string;
+  aliasLocale: AliasLocale;
 }
 
 export interface StorageSettings {

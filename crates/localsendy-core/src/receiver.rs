@@ -15,7 +15,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Weak,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -75,7 +75,11 @@ pub struct ReceiverState {
     pub received_files: Arc<RwLock<Vec<ReceivedFile>>>,
     pub incoming_transfers: Arc<RwLock<Vec<IncomingTransfer>>>,
     pub destination: Arc<RwLock<PathBuf>>,
-    pub auto_accept: bool,
+    /// Whether incoming transfers should be accepted without a user decision.
+    ///
+    /// This is shared with the control API so the setting can be changed while
+    /// the LocalSend listener remains running.
+    pub auto_accept: Arc<AtomicBool>,
     pub completed_tx: Option<mpsc::Sender<ReceivedFile>>,
 }
 
@@ -86,6 +90,12 @@ pub struct ReceiverHandle {
 }
 
 impl ReceiverHandle {
+    /// Return the running HTTP server so display identity can be updated by
+    /// the application without taking ownership of the receiver task.
+    pub fn server_handle(&self) -> Arc<ServerHandle> {
+        self.server.clone()
+    }
+
     pub async fn stop(mut self) {
         if let Some(stop_tx) = self.stop_tx.take() {
             let _ = stop_tx.send(());
@@ -239,7 +249,7 @@ async fn run_events(
                     server.clone(),
                 );
 
-                if state.auto_accept {
+                if state.auto_accept.load(Ordering::Relaxed) {
                     let ids = files.keys().cloned().collect::<HashSet<_>>();
                     let _ = decision_tx.send(PrepareUploadDecisionV2::Accept(ids));
                     continue;

@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, RwLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -11,6 +11,7 @@ use std::{
 use chrono::{DateTime, Utc};
 use localsendy_core::{
     DeviceIdentity, DeviceInfo, IncomingTransfer, PendingTransfer, ReceivedFile,
+    localsend::http::server::ServerHandle,
 };
 use serde::{Serialize, Serializer};
 use tokio::sync::{RwLock as AsyncRwLock, Semaphore, mpsc};
@@ -26,7 +27,11 @@ pub struct AppState {
     pub database: Database,
     pub instance_key: InstanceKey,
     pub identity: Arc<DeviceIdentity>,
-    pub local_device: DeviceInfo,
+    pub local_device: Arc<RwLock<DeviceInfo>>,
+    pub discovery_devices: Arc<RwLock<Vec<DeviceInfo>>>,
+    pub receiver_server: Arc<ServerHandle>,
+    pub auto_accept: Arc<AtomicBool>,
+    pub alias_locale: Arc<RwLock<String>>,
     pub devices: Arc<RwLock<HashMap<String, SeenDevice>>>,
     pub pending_transfer: Arc<AsyncRwLock<Option<PendingTransfer>>>,
     pub received_files: Arc<AsyncRwLock<Vec<ReceivedFile>>>,

@@ -140,6 +140,12 @@ impl AppState {
 /// A handle to a running server for interactions initiated by the application
 /// (as opposed to the event channels which are driven by incoming requests).
 pub struct ServerHandle {
+    /// Client information returned to peers by the LocalSend HTTP endpoints.
+    ///
+    /// Keeping this handle lets applications update display-only identity
+    /// fields (such as the alias) without restarting the listener.
+    info: Arc<Mutex<ClientInfo>>,
+
     v2: Option<Arc<V2State>>,
 
     /// The port the listeners are bound to.
@@ -155,6 +161,11 @@ pub struct ServerHandle {
 }
 
 impl ServerHandle {
+    /// Update the alias advertised by the LocalSend HTTP endpoints.
+    pub async fn update_alias(&self, alias: String) {
+        self.info.lock().await.alias = alias;
+    }
+
     /// The socket addresses this server can be reached at: every address of
     /// the non-loopback interfaces, restricted to the address families that
     /// are actually bound. The listeners themselves only know the wildcard
@@ -276,6 +287,7 @@ pub async fn start_with_port(
     });
 
     Ok(ServerHandle {
+        info,
         v2: state.v2.clone(),
         port: bound_port,
         ipv6_bound,

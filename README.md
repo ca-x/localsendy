@@ -13,7 +13,7 @@ Localsendy is a Docker-first LocalSend node with a responsive web interface. The
 - Automatic multi-interface IPv4/IPv6 UDP multicast discovery with optional advanced filtering
 - Automatic Ethernet-over-Wi-Fi preference when both adapters reach the same network, with runtime failover
 - Multi-file and clipboard-text sending to one or many LocalSend devices
-- Explicit accept/decline flow or startup automatic acceptance configured by environment
+- Explicit accept/decline flow or automatic acceptance configurable from the Settings > Environment variables panel
 - Live send/receive byte progress plus persistent outgoing and receive history
 - Responsive Send / Receive / Settings navigation based on the official LocalSend information architecture
 - English, Simplified Chinese, and Traditional Chinese UI foundations
@@ -30,6 +30,10 @@ docker compose up -d
 ```
 
 Open `http://<server-ip>:52222`. Received files are written to `./data/downloads`.
+
+## Security boundary
+
+The web control API is intentionally unauthenticated, so expose port `52222` only on a trusted LAN. Do not publish it directly to the Internet; bind it to loopback or protect it with your network controls when the host is on an untrusted network. When auto-accept is enabled, any device that can reach the LocalSend receiver can save files without an approval prompt, subject to the configured upload limit.
 
 The first start creates a persistent official-style random identity in `/data/device-identity.json`. To use a fixed name instead:
 
@@ -61,17 +65,17 @@ Network preferences and interface labels are saved to `/data/network-settings.js
 | `LOCALSENDY_DATA_DIR` | `/data` | Persistent storage root |
 | `LOCALSENDY_DOWNLOAD_DIR` | `/data/downloads` | Directory for received files; overrides the data-root default |
 | `LOCALSENDY_TEMP_DIR` | `/data/tmp` | Temporary workspace for runtime data |
-| `LOCALSENDY_AUTO_ACCEPT` | `false` | Accept incoming transfers automatically; evaluated at service startup |
+| `LOCALSENDY_AUTO_ACCEPT` | `false` | Startup default for accepting incoming transfers automatically; the Settings panel can override it and persist the choice |
 | `LOCALSENDY_DISCOVERY_INTERVAL_SECONDS` | `30` | Presence announcement interval, minimum 5 seconds |
 | `LOCALSENDY_NETWORK_INTERFACES` | `all` | Initial fallback: `all`, `*`, or a comma-separated interface list; persisted UI settings take precedence |
 | `LOCALSENDY_MAX_UPLOAD_BYTES` | `10737418240` | Maximum total size of one browser send request |
 | `RUST_LOG` | `localsendy=info,tower_http=info` | Rust tracing filter |
 
-Alias, device type, device model, and port are startup identity values. Change the environment and restart the container to apply them, matching LocalSend's server-restart behavior.
+The Settings > Environment variables panel persists automatic acceptance, the LocalSend display name, and the random-name language in `/data/localsendy.sqlite3`. These UI values override the corresponding environment defaults and apply immediately. Device type, device model, and port remain startup identity values; change their environment variables and restart the container to apply them.
 
 ## Current protocol boundaries
 
-Localsendy exposes only settings that the current service can enforce. Automatic acceptance and the save directory are supported. PIN validation, favorite-device trust rules, share-by-link, and configurable multicast groups are not implemented by the current service and are intentionally not shown as working controls.
+Localsendy exposes only settings that the current service can enforce. Automatic acceptance, the LocalSend display name, the random-name language, and the save directory are supported. PIN validation, favorite-device trust rules, share-by-link, and configurable multicast groups are not implemented by the current service and are intentionally not shown as working controls.
 
 ## Local development
 
