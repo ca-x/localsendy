@@ -142,11 +142,13 @@ export function startLinkShare(
   files: File[],
   autoAccept: boolean,
   pin: string,
+  shareUrl: string,
   onProgress: (progress: UploadProgress) => void,
 ) {
   const form = new FormData();
   form.append('autoAccept', String(autoAccept));
   if (pin) form.append('pin', pin);
+  form.append('shareUrl', shareUrl);
   files.forEach((file) => form.append('files', file, file.name));
   return uploadMultipart<LinkShare>('/share', form, onProgress);
 }

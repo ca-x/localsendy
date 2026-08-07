@@ -32,7 +32,7 @@ docker compose up -d
 
 Open `http://<server-ip>:52222`. Received files are written to `./data/downloads`.
 
-To share selected files with a browser, choose **Share via link** on the Send screen. The control UI remains at `http://<server-ip>:52222/` and the active browser download page is served from `http://<server-ip>:52222/share`, so no additional HTTP port is required.
+To share selected files with a browser, choose **Share via link** on the Send screen. Localsendy defaults to the current browser domain, which keeps reverse-proxy and LazyCat domains intact. Enable **LAN address** only when recipients should connect directly, then select one interface to generate `http://<interface-ip>:52222/share`. No additional HTTP port is required.
 
 Link sharing follows LocalSend's single-session model: one file batch is active at a time, starting another share replaces it, and accepted browsers may download its files repeatedly while it remains active. Leaving or stopping the share invalidates the link and removes its staged files. Each browser address can be approved or declined, or requests can be accepted automatically; an optional PIN can be embedded in the QR code.
 

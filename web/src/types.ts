@@ -22,6 +22,7 @@ export interface StatusResponse {
   deviceType?: DeviceInfo['deviceType'];
   deviceModel?: string;
   webAddress: string;
+  webPort: number;
   localsendPort: number;
   protocol: string;
   multicastIpv4: string;

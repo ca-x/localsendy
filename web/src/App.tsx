@@ -64,6 +64,8 @@ import { ConfirmDialog } from './components/ConfirmDialog';
 import { LinkShareView } from './components/LinkShareView';
 import { detectLocale, messages } from './i18n';
 import { formatBytes, formatTime } from './format';
+import { browserShareUrl, interfaceShareUrl, shareAddressForInterface } from './share-url';
+import { summarizeSendProgress } from './send-progress';
 import type {
   DeviceInfo,
   AliasLocale,
@@ -122,6 +124,13 @@ export default function App() {
   const [isLinkShareView, setIsLinkShareView] = useState(false);
   const [isStartingLinkShare, setIsStartingLinkShare] = useState(false);
   const [linkShareUploadProgress, setLinkShareUploadProgress] = useState<UploadProgress | null>(null);
+  const [isShareAddressOpen, setIsShareAddressOpen] = useState(false);
+  const [shareNetworks, setShareNetworks] = useState<NetworkSettings | null>(null);
+  const [isLoadingShareNetworks, setIsLoadingShareNetworks] = useState(false);
+  const [sendStartedAt, setSendStartedAt] = useState<number | null>(null);
+  const [sendTargetAliases, setSendTargetAliases] = useState<Set<string>>(new Set());
+  const [sendTargetCount, setSendTargetCount] = useState(0);
+  const [knownTransferIds, setKnownTransferIds] = useState<Set<string>>(new Set());
   const fileInputRef = useRef<HTMLInputElement>(null);
   const copy = useMemo(() => messages(locale), [locale]);
 
@@ -238,6 +247,10 @@ export default function App() {
     if (sendMode === 'files' && files.length === 0) return;
     if (sendMode === 'text' && !textMessage.trim()) return;
     setIsSending(true);
+    setSendStartedAt(Date.now());
+    setSendTargetAliases(new Set(targets.map((target) => target.alias)));
+    setSendTargetCount(targets.length);
+    setKnownTransferIds(new Set(transfers.map((transfer) => transfer.id)));
     setBrowserUploadProgress(sendMode === 'files' ? {
       loaded: 0,
       total: files.reduce((total, file) => total + file.size, 0),
@@ -277,13 +290,27 @@ export default function App() {
     }
   }
 
-  async function handleStartLinkShare() {
+  async function openShareAddressDialog() {
     if (files.length === 0) return;
+    setIsShareAddressOpen(true);
+    setIsLoadingShareNetworks(true);
+    try {
+      setShareNetworks(await getNetworkSettings());
+    } catch (requestError) {
+      setError(requestError instanceof Error ? requestError.message : copy.error);
+    } finally {
+      setIsLoadingShareNetworks(false);
+    }
+  }
+
+  async function handleStartLinkShare(shareUrl: string) {
+    if (files.length === 0) return;
+    setIsShareAddressOpen(false);
     setIsStartingLinkShare(true);
     setError(null);
     setLinkShareUploadProgress({ loaded: 0, total: files.reduce((total, file) => total + file.size, 0) });
     try {
-      const next = await startLinkShare(files, false, '', setLinkShareUploadProgress);
+      const next = await startLinkShare(files, false, '', shareUrl, setLinkShareUploadProgress);
       setLinkShare(next);
       setIsLinkShareView(true);
     } catch (requestError) {
@@ -346,6 +373,16 @@ export default function App() {
     setActiveTab(id);
   };
 
+  const currentSendTransfers = sendStartedAt === null ? [] : transfers.filter((transfer) =>
+    !knownTransferIds.has(transfer.id)
+      && sendTargetAliases.has(transfer.targetAlias)
+      && new Date(transfer.createdAt).getTime() >= sendStartedAt - 1000,
+  );
+  const fileBytes = files.reduce((total, file) => total + file.size, 0);
+  const completeSendProgress = browserUploadProgress && isSending
+    ? summarizeSendProgress(browserUploadProgress, currentSendTransfers, fileBytes * sendTargetCount)
+    : null;
+
   function toggleDevice(device: DeviceInfo) {
     const key = deviceKey(device);
     setSelectedDeviceIds((current) => {
@@ -378,7 +415,7 @@ export default function App() {
         </nav>
         <div className="sidebar-footer">
           <StatusPill status={status} copy={copy} />
-          <span className="version-label">v{status?.version ?? '0.3.0'}</span>
+          <span className="version-label">v{status?.version ?? '0.3.1'}</span>
         </div>
       </aside>
 
@@ -437,6 +474,9 @@ export default function App() {
             isProbing={isProbing}
             isSending={isSending}
             browserUploadProgress={browserUploadProgress}
+            completeSendProgress={completeSendProgress}
+            currentSendTransfers={currentSendTransfers}
+            sendTargetCount={sendTargetCount}
             isDragging={isDragging}
             fileInputRef={fileInputRef}
             onScan={handleScan}
@@ -451,7 +491,7 @@ export default function App() {
             onClearFiles={() => setFiles([])}
             onRemoveFile={(index) => setFiles((current) => current.filter((_, currentIndex) => currentIndex !== index))}
             onSend={handleSend}
-            onLinkShare={handleStartLinkShare}
+            onLinkShare={openShareAddressDialog}
             isStartingLinkShare={isStartingLinkShare}
             linkShareUploadProgress={linkShareUploadProgress}
           />
@@ -459,6 +499,16 @@ export default function App() {
         {activeTab === 'receive' ? <ReceiveView copy={copy} status={status} pending={pending} history={history} incomingTransfers={incomingTransfers} onDecision={handlePending} /> : null}
         {activeTab === 'settings' ? <SettingsView copy={copy} locale={locale} theme={theme} status={status} onLocale={setLocale} onTheme={setTheme} onError={setError} onNotice={setNotice} /> : null}
       </main>
+
+      <ShareAddressDialog
+        open={isShareAddressOpen}
+        copy={copy}
+        status={status}
+        networks={shareNetworks}
+        isLoading={isLoadingShareNetworks}
+        onCancel={() => setIsShareAddressOpen(false)}
+        onConfirm={handleStartLinkShare}
+      />
 
       <nav className="mobile-nav" aria-label="Primary navigation">
         {navItems.map(({ id, icon: Icon, label }) => (
@@ -471,6 +521,58 @@ export default function App() {
       </nav>
     </div>
   );
+}
+
+function ShareAddressDialog({ open, copy, status, networks, isLoading, onCancel, onConfirm }: {
+  open: boolean;
+  copy: Record<string, string>;
+  status: StatusResponse | null;
+  networks: NetworkSettings | null;
+  isLoading: boolean;
+  onCancel: () => void;
+  onConfirm: (shareUrl: string) => void;
+}) {
+  const [useLanAddress, setUseLanAddress] = useState(false);
+  const [selectedInterface, setSelectedInterface] = useState('');
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const availableNetworks = networks?.interfaces.filter((network) => shareAddressForInterface(network)) ?? [];
+  const currentUrl = browserShareUrl(window.location.href);
+  const selectedNetwork = availableNetworks.find((network) => network.name === selectedInterface);
+  const selectedAddress = selectedNetwork ? shareAddressForInterface(selectedNetwork) : undefined;
+  const shareUrl = useLanAddress && selectedAddress
+    ? interfaceShareUrl(selectedAddress, status?.webPort ?? 52222)
+    : currentUrl;
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (open && dialog && !dialog.open) {
+      setUseLanAddress(false);
+      setSelectedInterface('');
+      dialog.showModal();
+    } else if (!open && dialog?.open) {
+      dialog.close();
+    }
+  }, [open]);
+
+  return <dialog ref={dialogRef} className="share-address-dialog" onCancel={(event) => { event.preventDefault(); onCancel(); }} onClose={onCancel}>
+    <div className="share-address-dialog-content">
+      <div className="share-address-dialog-header"><div><span className="eyebrow">{copy.shareAddress}</span><h2>{copy.chooseShareAddress}</h2></div><button className="icon-button" type="button" aria-label={copy.close} onClick={onCancel}><X size={17} /></button></div>
+      <div className="share-address-preview"><span className="share-address-source"><Link2 size={16} aria-hidden="true" />{useLanAddress ? copy.lanAddress : copy.currentDomain}</span><code>{shareUrl}</code></div>
+      <label className="share-lan-toggle"><span><strong>{copy.enableLanAddress}</strong><small>{copy.enableLanAddressHint}</small></span><input type="checkbox" checked={useLanAddress} onChange={(event) => setUseLanAddress(event.target.checked)} /><span className="check-box" aria-hidden="true"><Check size={14} /></span></label>
+      {useLanAddress ? <fieldset className="share-interface-picker"><legend>{copy.chooseNetworkInterface}</legend>
+        {isLoading ? <div className="network-loading"><RefreshCw size={17} className="spin" aria-hidden="true" />{copy.loading}</div> : null}
+        {!isLoading && availableNetworks.length === 0 ? <div className="network-empty"><Wifi size={18} aria-hidden="true" />{copy.noNetworkInterfaces}</div> : null}
+        {availableNetworks.map((network) => {
+          const address = shareAddressForInterface(network);
+          return <label key={network.name} className={`share-interface-option ${selectedInterface === network.name ? 'selected' : ''}`}>
+            <input className="sr-only" type="radio" name="share-interface" value={network.name} checked={selectedInterface === network.name} onChange={() => setSelectedInterface(network.name)} />
+            <span className="radio-dot" aria-hidden="true" /><span><strong>{network.label || network.name}</strong><small>{address?.split('/')[0]} · {copy[`interfaceKind${network.kind[0].toUpperCase()}${network.kind.slice(1)}`]}</small></span>
+          </label>;
+        })}
+      </fieldset> : null}
+      <div className="confirm-dialog-actions"><button className="secondary-button" type="button" onClick={onCancel}>{copy.cancel}</button><button className="primary-button" type="button" disabled={useLanAddress && !selectedAddress} onClick={() => onConfirm(shareUrl)}><Link2 size={17} aria-hidden="true" />{copy.startSharing}</button></div>
+    </div>
+  </dialog>;
 }
 
 function Brand({ copy }: { copy: Record<string, string> }) {
@@ -499,6 +601,9 @@ function SendView(props: {
   isProbing: boolean;
   isSending: boolean;
   browserUploadProgress: UploadProgress | null;
+  completeSendProgress: UploadProgress | null;
+  currentSendTransfers: OutgoingTransfer[];
+  sendTargetCount: number;
   isDragging: boolean;
   fileInputRef: React.RefObject<HTMLInputElement | null>;
   onScan: () => void;
@@ -605,12 +710,15 @@ function SendView(props: {
           </div>
           <button className="primary-button send-cta" type="button" disabled={selectedCount === 0 || !payloadReady || props.isSending} onClick={props.onSend}>{props.isSending ? <RefreshCw size={18} className="spin" aria-hidden="true" /> : <SendIcon size={18} aria-hidden="true" />}{props.isSending ? copy.sending : selectedCount > 0 ? `${copy.sendToDevices} (${selectedCount})` : copy.selectDevice}<ChevronRight size={17} aria-hidden="true" /></button>
           {props.browserUploadProgress ? <div className="browser-upload-progress"><ProgressBar
-            value={props.browserUploadProgress.loaded}
-            total={props.browserUploadProgress.total}
-            label={props.browserUploadProgress.total > 0 && props.browserUploadProgress.loaded >= props.browserUploadProgress.total
-              ? copy.uploadStaged
-              : `${copy.uploadingToServer} ${formatBytes(props.browserUploadProgress.loaded)} / ${formatBytes(props.browserUploadProgress.total)}`}
-          /></div> : null}
+            value={props.completeSendProgress?.loaded ?? props.browserUploadProgress.loaded}
+            total={props.completeSendProgress?.total ?? props.browserUploadProgress.total}
+            label={`${copy.completeTransferProgress} ${formatBytes(props.completeSendProgress?.loaded ?? props.browserUploadProgress.loaded)} / ${formatBytes(props.completeSendProgress?.total ?? props.browserUploadProgress.total)}`}
+          />
+          <div className="progress-phase-list">
+            <span className={props.browserUploadProgress.loaded >= props.browserUploadProgress.total ? 'complete' : 'active'}>{copy.uploadingToServer}: {formatBytes(props.browserUploadProgress.loaded)} / {formatBytes(props.browserUploadProgress.total)}</span>
+            <span className={props.currentSendTransfers.length > 0 ? 'active' : ''}>{copy.sendingToDevices}: {formatBytes(props.currentSendTransfers.reduce((total, transfer) => total + transfer.transferredBytes, 0))} / {formatBytes(Math.max(props.currentSendTransfers.reduce((total, transfer) => total + transfer.totalBytes, 0), props.files.reduce((total, file) => total + file.size, 0) * props.sendTargetCount))}</span>
+          </div>
+          </div> : null}
         </div>
       </div>
 
@@ -959,7 +1067,7 @@ function SettingsView({ copy, locale, theme, status, onLocale, onTheme, onError,
           </div>
         </div>
 
-        <div className="settings-section deployment-section"><div className="section-heading"><div><h2>{copy.deployment}</h2><p>Docker</p></div><Server size={21} className="section-icon" aria-hidden="true" /></div><p className="deployment-copy">{copy.deploymentHint}</p><div className="setting-row readonly-setting"><div className="setting-label"><ShieldCheck size={18} aria-hidden="true" /><span>{copy.version}</span></div><strong>v{status?.version ?? '0.3.0'}</strong></div></div>
+        <div className="settings-section deployment-section"><div className="section-heading"><div><h2>{copy.deployment}</h2><p>Docker</p></div><Server size={21} className="section-icon" aria-hidden="true" /></div><p className="deployment-copy">{copy.deploymentHint}</p><div className="setting-row readonly-setting"><div className="setting-label"><ShieldCheck size={18} aria-hidden="true" /><span>{copy.version}</span></div><strong>v{status?.version ?? '0.3.1'}</strong></div></div>
       </div>
       {storage ? <StorageDirectoryDialog
         open={isStoragePickerOpen}

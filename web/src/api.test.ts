@@ -108,6 +108,7 @@ describe('API responses', () => {
   });
 
   it('starts one link share with files before opening the share page', async () => {
+    let submittedBody: FormData | undefined;
     class FakeXmlHttpRequest {
       status = 200;
       responseText = JSON.stringify({ active: true, urls: ['http://host/share'], files: [] });
@@ -123,6 +124,7 @@ describe('API responses', () => {
 
       send(body: FormData) {
         this.body = body;
+        submittedBody = body;
         expect(body.get('autoAccept')).toBe('false');
         expect((body.get('files') as File).name).toBe('share.txt');
         this.onload?.();
@@ -134,8 +136,11 @@ describe('API responses', () => {
       [new File(['share'], 'share.txt', { type: 'text/plain' })],
       false,
       '',
+      'https://localsendy.lazycat.example/share',
       vi.fn(),
     )).resolves.toMatchObject({ active: true });
+
+    expect(submittedBody?.get('shareUrl')).toBe('https://localsendy.lazycat.example/share');
   });
 
   it('stops only the identified share with a keepalive delete request', async () => {

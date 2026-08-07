@@ -26,9 +26,10 @@ use uuid::Uuid;
 use crate::state::AppState;
 
 const MAX_SHARE_FILES: usize = 100;
-const MAX_SHARE_FIELDS: usize = MAX_SHARE_FILES + 2;
+const MAX_SHARE_FIELDS: usize = MAX_SHARE_FILES + 3;
 const MAX_PIN_BYTES: usize = 128;
 const MAX_BOOLEAN_BYTES: usize = 5;
+const MAX_SHARE_URL_BYTES: usize = 2048;
 const MAX_PIN_ATTEMPTS: u32 = 10;
 const SHARE_TEMP_PREFIX: &str = "share-";
 const DOWNLOAD_HTML: &str = include_str!("../third_party/localsend-core/assets/web/download.html");
@@ -38,6 +39,7 @@ pub struct LinkShareStore(Arc<tokio::sync::RwLock<Option<ActiveLinkShare>>>);
 
 struct ActiveLinkShare {
     share_id: Uuid,
+    share_url: String,
     files: HashMap<String, SharedFile>,
     total_bytes: u64,
     auto_accept: bool,
@@ -167,6 +169,7 @@ async fn start_share(
 ) -> Result<Json<LinkShareResponse>, ShareError> {
     let mut auto_accept = false;
     let mut pin = None;
+    let mut share_url = None;
     let mut files = HashMap::new();
     let mut total_bytes = 0_u64;
     let mut staged_files = StagedShareFiles::default();
@@ -189,6 +192,10 @@ async fn start_share(
             "pin" => {
                 let value = read_text_field(&mut field, MAX_PIN_BYTES).await?;
                 pin = normalize_pin(value);
+            }
+            "shareUrl" => {
+                let value = read_text_field(&mut field, MAX_SHARE_URL_BYTES).await?;
+                share_url = Some(normalize_share_url(&value)?);
             }
             "files" => {
                 if files.len() >= MAX_SHARE_FILES {
@@ -265,9 +272,11 @@ async fn start_share(
     if files.is_empty() {
         return Err(ShareError::bad_request("Select at least one file"));
     }
+    let share_url = share_url.ok_or_else(|| ShareError::bad_request("Missing share URL"))?;
 
     let active = ActiveLinkShare {
         share_id: Uuid::new_v4(),
+        share_url,
         files,
         total_bytes,
         auto_accept,
@@ -554,7 +563,7 @@ async fn share_response(state: &AppState) -> LinkShareResponse {
         return LinkShareResponse {
             active: false,
             share_id: None,
-            urls: share_urls(state.config.web_bind),
+            urls: Vec::new(),
             files: Vec::new(),
             total_bytes: 0,
             auto_accept: false,
@@ -588,7 +597,7 @@ async fn share_response(state: &AppState) -> LinkShareResponse {
     LinkShareResponse {
         active: true,
         share_id: Some(active.share_id),
-        urls: share_urls(state.config.web_bind),
+        urls: vec![active.share_url.clone()],
         files,
         total_bytes: active.total_bytes,
         auto_accept: active.auto_accept,
@@ -598,28 +607,22 @@ async fn share_response(state: &AppState) -> LinkShareResponse {
     }
 }
 
-fn share_urls(bind: SocketAddr) -> Vec<String> {
-    let port = bind.port();
-    let mut addresses = if bind.ip().is_unspecified() {
-        if_addrs::get_if_addrs()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|interface| interface.ip())
-            .filter(|ip| !ip.is_loopback())
-            .filter(|ip| !matches!(ip, IpAddr::V6(ip) if ip.is_unicast_link_local()))
-            .collect::<Vec<_>>()
-    } else {
-        vec![bind.ip()]
-    };
-    addresses.sort();
-    addresses.dedup();
-    addresses
-        .into_iter()
-        .map(|ip| match ip {
-            IpAddr::V4(ip) => format!("http://{ip}:{port}/share"),
-            IpAddr::V6(ip) => format!("http://[{ip}]:{port}/share"),
-        })
-        .collect()
+fn normalize_share_url(value: &str) -> Result<String, ShareError> {
+    let mut url = reqwest::Url::parse(value.trim())
+        .map_err(|_| ShareError::bad_request("Share URL is invalid"))?;
+    if !matches!(url.scheme(), "http" | "https")
+        || url.host().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(ShareError::bad_request(
+            "Share URL must be an HTTP(S) origin",
+        ));
+    }
+    url.set_path("/share");
+    Ok(url.to_string())
 }
 
 fn check_pin(
@@ -899,6 +902,7 @@ mod tests {
     fn empty_share() -> ActiveLinkShare {
         ActiveLinkShare {
             share_id: Uuid::new_v4(),
+            share_url: "https://localsendy.example/share".to_owned(),
             files: HashMap::new(),
             total_bytes: 0,
             auto_accept: false,
@@ -910,11 +914,13 @@ mod tests {
     }
 
     #[test]
-    fn share_entry_is_fixed_and_uses_the_web_port() {
-        assert_eq!(
-            share_urls("192.168.1.20:52222".parse().unwrap()),
-            vec!["http://192.168.1.20:52222/share"]
-        );
+    fn selected_share_url_is_normalized_to_the_share_path() {
+        let Ok(url) = normalize_share_url("https://localsendy.example/control") else {
+            panic!("valid HTTPS URL should be accepted");
+        };
+        assert_eq!(url, "https://localsendy.example/share");
+        assert!(normalize_share_url("file:///tmp/share").is_err());
+        assert!(normalize_share_url("https://user@example.com/share").is_err());
     }
 
     #[test]

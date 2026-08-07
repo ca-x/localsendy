@@ -1,5 +1,12 @@
 # Changelog
 
+## v0.3.1 - 2026-08-07
+
+- Show one complete, byte-accurate progress indicator across browser staging and delivery to every selected device.
+- Choose the link-share address before uploading, defaulting to the browser's current domain for reverse-proxied deployments such as LazyCat.
+- Add an optional LAN-address picker that generates one URL from the selected network interface and the Localsendy web port.
+- Store and display only the selected share URL instead of enumerating virtual, container, and otherwise unreachable interface addresses.
+
 ## v0.3.0 - 2026-08-06
 
 - Add official-style link sharing for selected files on the existing web port at `/share`.
