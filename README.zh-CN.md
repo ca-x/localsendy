@@ -68,7 +68,7 @@ Linux 使用 host 网络时，Localsendy 会自动监听宿主机上的全部可
 | `LOCALSENDY_DEVICE_MODEL` | 自动检测系统 | 展示给对端的任意型号，例如 `Linux`、`Windows` 或产品名称 |
 | `LOCALSENDY_PORT` | `53317` | LocalSend HTTPS 与发现端口 |
 | `LOCALSENDY_DATA_DIR` | `/data` | 持久化数据根目录 |
-| `LOCALSENDY_DOWNLOAD_DIR` | `/data/downloads` | 接收文件保存目录，会覆盖数据根目录下的默认路径 |
+| `LOCALSENDY_DOWNLOAD_DIR` | `/data/downloads` | 新实例的目录选择范围初始值；界面选择的目录会持久化并优先恢复 |
 | `LOCALSENDY_TEMP_DIR` | `/data/tmp` | 运行时临时数据目录 |
 | `LOCALSENDY_AUTO_ACCEPT` | `false` | 自动接受传入请求的启动默认值；“设置”界面可以覆盖并保存此选择 |
 | `LOCALSENDY_DISCOVERY_INTERVAL_SECONDS` | `30` | 局域网广播间隔，最小 5 秒 |
@@ -76,7 +76,7 @@ Linux 使用 host 网络时，Localsendy 会自动监听宿主机上的全部可
 | `LOCALSENDY_MAX_UPLOAD_BYTES` | `10737418240` | 单次浏览器发送请求的总大小上限 |
 | `RUST_LOG` | `localsendy=info,tower_http=info` | Rust 日志过滤器 |
 
-“设置 > 环境变量”会把自动接受、LocalSend 网络显示名称和随机名称语言保存到 `/data/localsendy.sqlite3`。界面中的值会覆盖对应的环境变量默认值，并立即生效；设备类型、设备型号和端口仍属于启动身份，修改它们的环境变量后需要重启容器。
+“设置”界面会把自动接受、LocalSend 网络显示名称、随机名称语言和接收目录保存到 `/data/localsendy.sqlite3`。界面中的值会覆盖对应的环境变量默认值，并立即生效。`LOCALSENDY_DOWNLOAD_DIR` 只在首次创建实例时初始化目录选择范围；之后修改环境变量，不会覆盖已持久化的范围和保存目录。设备类型、设备型号和端口仍属于启动身份，修改它们的环境变量后需要重启容器。
 
 ## 当前协议边界
 

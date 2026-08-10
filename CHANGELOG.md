@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.3.2 - 2026-08-10
+
+- Treat `LOCALSENDY_DOWNLOAD_DIR` as the one-time directory-selection scope initializer for new instances.
+- Restore the persisted receive directory before considering later environment changes, so UI selections survive restarts.
+- Clarify the storage scope and configuration precedence in Settings and the deployment documentation.
+
 ## v0.3.1 - 2026-08-07
 
 - Show one complete, byte-accurate progress indicator across browser staging and delivery to every selected device.

@@ -68,7 +68,7 @@ Network preferences and interface labels are saved to `/data/network-settings.js
 | `LOCALSENDY_DEVICE_MODEL` | detected OS | Arbitrary display model shown to peers, such as `Linux`, `Windows`, or a product name |
 | `LOCALSENDY_PORT` | `53317` | LocalSend HTTPS and discovery port |
 | `LOCALSENDY_DATA_DIR` | `/data` | Persistent storage root |
-| `LOCALSENDY_DOWNLOAD_DIR` | `/data/downloads` | Directory for received files; overrides the data-root default |
+| `LOCALSENDY_DOWNLOAD_DIR` | `/data/downloads` | Initial directory-selection scope for a new instance; the directory selected in the UI is persisted and restored first |
 | `LOCALSENDY_TEMP_DIR` | `/data/tmp` | Temporary workspace for runtime data |
 | `LOCALSENDY_AUTO_ACCEPT` | `false` | Startup default for accepting incoming transfers automatically; the Settings panel can override it and persist the choice |
 | `LOCALSENDY_DISCOVERY_INTERVAL_SECONDS` | `30` | Presence announcement interval, minimum 5 seconds |
@@ -76,7 +76,7 @@ Network preferences and interface labels are saved to `/data/network-settings.js
 | `LOCALSENDY_MAX_UPLOAD_BYTES` | `10737418240` | Maximum total size of one browser send request |
 | `RUST_LOG` | `localsendy=info,tower_http=info` | Rust tracing filter |
 
-The Settings > Environment variables panel persists automatic acceptance, the LocalSend display name, and the random-name language in `/data/localsendy.sqlite3`. These UI values override the corresponding environment defaults and apply immediately. Device type, device model, and port remain startup identity values; change their environment variables and restart the container to apply them.
+The Settings UI persists automatic acceptance, the LocalSend display name, the random-name language, and the selected receive directory in `/data/localsendy.sqlite3`. These UI values override the corresponding environment defaults and apply immediately. `LOCALSENDY_DOWNLOAD_DIR` initializes the directory-selection scope only when the instance is first created; later environment changes do not replace the persisted scope or selected directory. Device type, device model, and port remain startup identity values; change their environment variables and restart the container to apply them.
 
 ## Current protocol boundaries
 

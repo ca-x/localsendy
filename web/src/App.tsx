@@ -415,7 +415,7 @@ export default function App() {
         </nav>
         <div className="sidebar-footer">
           <StatusPill status={status} copy={copy} />
-          <span className="version-label">v{status?.version ?? '0.3.1'}</span>
+          <span className="version-label">v{status?.version ?? '0.3.2'}</span>
         </div>
       </aside>
 
@@ -997,6 +997,7 @@ function SettingsView({ copy, locale, theme, status, onLocale, onTheme, onError,
             </button>
           </div>
           <p className="storage-root-hint">{copy.storageRoot}: <code>{storage?.root ?? copy.loading}</code></p>
+          <p className="storage-preference-hint">{copy.storagePreferenceHint}</p>
         </div>
 
         <div className="settings-section environment-settings-section">
@@ -1067,7 +1068,7 @@ function SettingsView({ copy, locale, theme, status, onLocale, onTheme, onError,
           </div>
         </div>
 
-        <div className="settings-section deployment-section"><div className="section-heading"><div><h2>{copy.deployment}</h2><p>Docker</p></div><Server size={21} className="section-icon" aria-hidden="true" /></div><p className="deployment-copy">{copy.deploymentHint}</p><div className="setting-row readonly-setting"><div className="setting-label"><ShieldCheck size={18} aria-hidden="true" /><span>{copy.version}</span></div><strong>v{status?.version ?? '0.3.1'}</strong></div></div>
+        <div className="settings-section deployment-section"><div className="section-heading"><div><h2>{copy.deployment}</h2><p>Docker</p></div><Server size={21} className="section-icon" aria-hidden="true" /></div><p className="deployment-copy">{copy.deploymentHint}</p><div className="setting-row readonly-setting"><div className="setting-label"><ShieldCheck size={18} aria-hidden="true" /><span>{copy.version}</span></div><strong>v{status?.version ?? '0.3.2'}</strong></div></div>
       </div>
       {storage ? <StorageDirectoryDialog
         open={isStoragePickerOpen}

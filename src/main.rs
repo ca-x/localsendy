@@ -8,6 +8,7 @@ mod web;
 
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::atomic::AtomicBool,
     sync::{Arc, RwLock},
     time::Instant,
@@ -60,9 +61,6 @@ async fn main() -> Result<()> {
         .or_else(|| std::env::var("LOCALSENDY_ALIAS_LOCALE").ok())
         .unwrap_or_else(|| "auto".to_owned());
     let alias_locale = config::normalize_alias_locale(&alias_locale)?;
-    tokio::fs::create_dir_all(config.downloads_dir())
-        .await
-        .context("failed to create downloads directory")?;
     tokio::fs::create_dir_all(config.temp_dir())
         .await
         .context("failed to create temporary upload directory")?;
@@ -73,15 +71,10 @@ async fn main() -> Result<()> {
         .await
         .context("failed to clean stale link-share files")?;
 
-    let download_root = config.downloads_dir();
-    let configured_subdirectory = database
-        .load_setting::<String>(SettingScope::Instance(&instance_key), "save_subdirectory")?
-        .unwrap_or_default();
-    let (download_subdirectory, receiver_path) =
-        storage_path::resolve_subdirectory(&download_root, &configured_subdirectory).await?;
-    tokio::fs::create_dir_all(&receiver_path).await?;
-    let download_subdirectory = Arc::new(AsyncRwLock::new(download_subdirectory));
-    let receiver_destination = Arc::new(AsyncRwLock::new(receiver_path));
+    let storage = initialize_storage(&database, &instance_key, &instance.download_path).await?;
+    let download_root = storage.root;
+    let download_subdirectory = Arc::new(AsyncRwLock::new(storage.subdirectory));
+    let receiver_destination = Arc::new(AsyncRwLock::new(storage.destination));
 
     let identity = Arc::new(DeviceIdentity::load_or_generate(
         &config.data_dir,
@@ -263,6 +256,30 @@ fn default_model() -> String {
     std::env::consts::OS.to_owned()
 }
 
+struct StorageRuntime {
+    root: PathBuf,
+    subdirectory: String,
+    destination: PathBuf,
+}
+
+async fn initialize_storage(
+    database: &Database,
+    instance_key: &InstanceKey,
+    persisted_root: &str,
+) -> Result<StorageRuntime> {
+    let root = PathBuf::from(persisted_root);
+    let configured_subdirectory = database
+        .load_setting::<String>(SettingScope::Instance(instance_key), "save_subdirectory")?
+        .unwrap_or_default();
+    let (subdirectory, destination) =
+        storage_path::resolve_subdirectory(&root, &configured_subdirectory).await?;
+    Ok(StorageRuntime {
+        root,
+        subdirectory,
+        destination,
+    })
+}
+
 fn device_type_name(device_type: DeviceType) -> &'static str {
     match device_type {
         DeviceType::Mobile => "mobile",
@@ -315,11 +332,63 @@ fn install_crypto_provider() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::install_crypto_provider;
+    use super::{initialize_storage, install_crypto_provider};
+    use localsendy_storage::{Database, InstanceDefaults, InstanceKey, SettingScope};
 
     #[test]
     fn installs_ring_crypto_provider() {
         let _ = install_crypto_provider();
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    #[tokio::test]
+    async fn persisted_storage_scope_and_ui_selection_override_a_changed_environment_default() {
+        let directory = tempfile::tempdir().unwrap();
+        let initial_root = directory.path().join("documents");
+        let selected = initial_root.join("mhwy").join("下载");
+        let changed_root = directory.path().join("other");
+        tokio::fs::create_dir_all(&selected).await.unwrap();
+        let database = Database::open(&directory.path().join("localsendy.sqlite3")).unwrap();
+        let key = InstanceKey::single();
+        let initial_root_text = initial_root.display().to_string();
+        let changed_root_text = changed_root.display().to_string();
+
+        database
+            .ensure_instance(InstanceDefaults {
+                key: &key,
+                alias: "First",
+                device_type: "server",
+                device_model: Some("Linux"),
+                preferred_port: 53317,
+                identity_path: "/data/identity.pem",
+                download_path: &initial_root_text,
+            })
+            .unwrap();
+        database
+            .store_setting(
+                SettingScope::Instance(&key),
+                "save_subdirectory",
+                &"mhwy/下载",
+            )
+            .unwrap();
+        let restored = database
+            .ensure_instance(InstanceDefaults {
+                key: &key,
+                alias: "Changed",
+                device_type: "server",
+                device_model: Some("Linux"),
+                preferred_port: 54000,
+                identity_path: "/other/identity.pem",
+                download_path: &changed_root_text,
+            })
+            .unwrap();
+
+        let storage = initialize_storage(&database, &key, &restored.download_path)
+            .await
+            .unwrap();
+
+        assert_eq!(storage.root, initial_root);
+        assert_eq!(storage.subdirectory, "mhwy/下载");
+        assert_eq!(storage.destination, selected);
     }
 }

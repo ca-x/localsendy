@@ -359,6 +359,7 @@ h2 { font-size: 1rem; line-height: 1.25; letter-spacing: 0; }
 .storage-choose-button { min-height: 48px; }
 .storage-root-hint { margin-top: 8px; color: var(--color-subtle); font-size: 0.66rem; line-height: 1.5; }
 .storage-root-hint code { overflow-wrap: anywhere; color: var(--color-foreground); }
+.storage-preference-hint { margin-top: 3px; color: var(--color-subtle); font-size: 0.63rem; line-height: 1.5; }
 .directory-dialog { width: min(620px, calc(100vw - 32px)); max-height: min(720px, calc(100vh - 32px)); overflow: hidden; border: 1px solid var(--color-border); border-radius: 8px; padding: 0; background: var(--color-background); color: var(--color-foreground); box-shadow: 0 24px 70px rgb(15 23 42 / 0.22); animation: dialog-in 180ms var(--ease-out); }
 .directory-dialog::backdrop { background: rgb(15 23 42 / 0.48); backdrop-filter: blur(2px); animation: backdrop-in 160ms ease-out; }
 .directory-dialog-header { min-height: 76px; display: flex; align-items: center; justify-content: space-between; gap: 20px; border-bottom: 1px solid var(--color-border); padding: 15px 18px; }
