@@ -32,7 +32,7 @@ socket2 = { version = "0.6.2", features = ["all"] }
 tokio = { version = "1.49.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-stream = "0.1.18"
 tokio-util = { version = "0.7.18", features = ["io", "rt"] }
-tower-http = { version = "0.6.8", features = ["catch-panic", "compression-gzip", "set-header", "trace"] }
+tower-http = { version = "0.7.0", features = ["catch-panic", "compression-gzip", "set-header", "trace"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
 uuid = { version = "1.19.0", features = ["serde", "v4"] }
